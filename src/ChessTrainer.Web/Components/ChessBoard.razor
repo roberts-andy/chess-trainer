@@ -1,0 +1,36 @@
+@using ChessTrainer.Core
+<div class="chessboard" style="--square-light:@Light;--square-dark:@Dark" aria-label="Chess position">
+    @for (int row = 0; row < 8; row++)
+    {
+        @for (int col = 0; col < 8; col++)
+        {
+            string square = $"{(char)('a' + (Flipped ? 7 - col : col))}{(Flipped ? row + 1 : 8 - row)}";
+            char piece = position.PieceAt(square);
+            <button type="button" class="square @((row + col) % 2 == 0 ? "light" : "dark") @(Selected == square ? "chosen" : "")"
+                    aria-label="@Label(square, piece)" aria-pressed="@(Selected == square)" disabled="@ReadOnly"
+                    @onclick="() => OnSquare.InvokeAsync(square)" @ondrop="() => OnSquare.InvokeAsync(square)" @ondragover:preventDefault>
+                @if (piece != ' ')
+                {
+                    <img src="@($"/pieces/{PieceSet}/{(char.IsUpper(piece) ? 'w' : 'b')}{char.ToUpperInvariant(piece)}.svg")"
+                         alt="" draggable="@(!ReadOnly)" @ondragstart="() => OnSquare.InvokeAsync(square)" />
+                }
+                @if (col == 0) { <span class="rank">@square[1]</span> }
+                @if (row == 7) { <span class="file">@square[0]</span> }
+            </button>
+        }
+    }
+</div>
+@code {
+    [Parameter] public string Fen { get; set; } = "4k3/8/8/8/8/8/8/4K3 w - - 0 1";
+    [Parameter] public bool Flipped { get; set; }
+    [Parameter] public bool ReadOnly { get; set; }
+    [Parameter] public string? Selected { get; set; }
+    [Parameter] public string PieceSet { get; set; } = "chessnut";
+    [Parameter] public string Light { get; set; } = "#EAEDDC";
+    [Parameter] public string Dark { get; set; } = "#84A089";
+    [Parameter] public EventCallback<string> OnSquare { get; set; }
+    private ChessPosition position = new("4k3/8/8/8/8/8/8/4K3 w - - 0 1");
+    protected override void OnParametersSet() => position = new(Fen);
+    private static string Label(string square, char piece) => piece == ' ' ? $"{square}: empty" :
+        $"{square}: {(char.IsUpper(piece) ? "White" : "Black")} {char.ToUpperInvariant(piece) switch { 'K' => "king", 'Q' => "queen", 'R' => "rook", 'B' => "bishop", 'N' => "knight", _ => "pawn" }}";
+}

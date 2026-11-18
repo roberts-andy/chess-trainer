@@ -21,10 +21,14 @@ public sealed partial class TrainerStore
     public const string DatabaseUrl = "https://database.lichess.org/lichess_db_puzzle.csv.zst";
     private readonly string connectionString;
 
-    public TrainerStore(string path)
+    public TrainerStore(string path, bool readOnly = false)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
-        connectionString = new SqliteConnectionStringBuilder { DataSource = path, DefaultTimeout = 60 }.ToString();
+        if (!readOnly) Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
+        connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = path, DefaultTimeout = 60,
+            Mode = readOnly ? SqliteOpenMode.ReadOnly : SqliteOpenMode.ReadWriteCreate
+        }.ToString();
     }
 
     private SqliteConnection Open()

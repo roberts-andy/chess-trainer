@@ -1,0 +1,497 @@
+@page "/"
+@using System.Security.Claims
+@using ChessTrainer.Core
+@using Microsoft.AspNetCore.Components.Authorization
+@inject AuthenticationStateProvider Authentication
+@inject CloudAccess Access
+@inject CloudStore Store
+@inject CloudTraining Training
+@inject VisionService Vision
+@inject IJSRuntime JS
+@inject ILogger<Home> Logger
+@implements IAsyncDisposable
+
+<PageTitle>Chess Trainer</PageTitle>
+<!-- THESIS: Calculation first, with no assessment before Submit.
+OWN-WORLD: The existing Fluent system, neutral surfaces, blue selection, six board palettes and bundled chess pieces.
+STORY: Choose a puzzle or study, calculate both sides, submit, then review.
+FIRST VIEWPORT: Board on the left, notation on the right, with an always-visible submission action; stacked on phones.
+FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation rather than shrinking the desktop canvas. -->
+<div class="app-shell" data-theme="@theme">
+    <header class="app-header">
+        <a class="brand" href="/">Chess Trainer</a>
+        @if (owner is not null) { <span class="connection">@puzzleCount.ToString("N0") puzzles <span aria-hidden="true">&middot;</span> Cloud library</span> }
+    </header>
+    @if (loading)
+    {
+        <main class="welcome"><h1>Opening your trainer</h1><p role="status">Loading your studies and saved analysis...</p></main>
+    }
+    else if (owner is null)
+    {
+        <main class="welcome">
+            <h1>Your calculation workspace,<br />on any screen.</h1>
+            <p>Practice both sides of a position. Record variations, keep your notes, and review the answer only when you submit.</p>
+            <a class="button primary" href="/.auth/login/aad?post_login_redirect_uri=/" data-enhance-nav="false">Sign in with Microsoft</a>
+            <p class="muted">This cloud workspace is restricted to its owner's account. The Windows app still works locally without sign-in.</p>
+            @if (error is not null) { <p class="notice error" role="alert">@error</p> }
+        </main>
+    }
+    else
+    {
+        <nav class="tabs" aria-label="Main navigation">
+            @foreach (string tab in new[] { "Practice", "Studies", "Results", "Appearance" })
+            {
+                <button class="@(page == tab ? "active" : "")" aria-current="@(page == tab ? "page" : null)" @onclick="() => ChangePage(tab)">@tab</button>
+            }
+        </nav>
+        @if (error is not null) { <div class="notice error" role="alert">@error <button aria-label="Dismiss error" @onclick="() => error = null">Dismiss</button></div> }
+        @if (message is not null) { <div class="notice" role="status">@message</div> }
+        @if (busy) { <div class="working" role="status">Saving or loading your workspace...</div> }
+        <fieldset class="workspace" disabled="@busy">
+        @if (page == "Practice")
+        {
+            <section class="practice-heading">
+                <div><h1>@(current?.Title ?? "Ready to calculate?")</h1><p class="muted">@(current is null ? "Choose a rating range to begin." : current.IsCustom ? "Study position" : $"Puzzle rating {current.Rating} · Lichess {current.PuzzleId}")</p></div>
+                <div class="filters">
+                    <label>Min rating<input type="number" min="0" max="10000" @bind="minimum" /></label>
+                    <label>Max rating<input type="number" min="0" max="10000" @bind="maximum" /></label>
+                    <button class="primary" @onclick="NextPuzzle">Next puzzle</button>
+                </div>
+            </section>
+            @if (current is not null)
+            {
+                <div class="practice-grid">
+                    <section class="board-pane" aria-label="Puzzle board">
+                        <ChessBoard Fen="@current.Fen" Flipped="@flipped" PieceSet="@pieces" Light="@Palette.Light" Dark="@Palette.Dark"
+                                    Selected="@selectedSquare" ReadOnly="@(current.Submitted || current.Mode != SolveMode.Board)" OnSquare="SquareClicked" />
+                        <div class="board-controls">
+                            <button @onclick="() => flipped = !flipped">Flip board</button>
+                            <div class="move-navigation" aria-label="Navigate moves">
+                                <button aria-label="Starting position" @onclick="() => Navigate(0)">|&lt;</button>
+                                <button aria-label="Previous move" @onclick="() => Navigate(current.Cursor - 1)">&lt;</button>
+                                <button aria-label="Next move" @onclick="() => Navigate(current.Cursor + 1)">&gt;</button>
+                                <button aria-label="End of line" @onclick="() => Navigate(ActiveLine.Moves.Count)">&gt;|</button>
+                            </div>
+                        </div>
+                        <p class="board-caption">@(new ChessPosition(current.Fen).WhiteToMove ? "White" : "Black") to move <span aria-hidden="true">&middot;</span> @(current.Mode == SolveMode.Visualization && !current.Submitted ? "Board stays at the starting position" : "Play both colors")</p>
+                    </section>
+                    <section class="analysis-pane">
+                        <h2>Your analysis</h2>
+                        <div class="analysis-content">
+                            <label>Solving mode<select value="@current.Mode" @onchange="ModeChanged">
+                                <option value="Board">Move pieces</option><option value="Notation">Enter notation</option><option value="Visualization">Visualization</option>
+                            </select></label>
+                            <label>Analysis line<select value="@current.LineIndex" @onchange="LineChanged">
+                                @for (int index = 0; index < current.Lines.Count; index++) { <option value="@index">@current.Lines[index].Name</option> }
+                            </select></label>
+                            <div class="moves" aria-label="Recorded moves">
+                                <button class="@(current.Cursor == 0 ? "selected" : "")" @onclick="() => Navigate(0)">Starting position</button>
+                                @for (int ply = 1; ply <= ActiveLine.San.Count; ply++)
+                                {
+                                    int cursor = ply;
+                                    var annotation = ActiveLine.Annotations.GetValueOrDefault(ply);
+                                    <button class="@(current.Cursor == ply ? "selected" : "")" @onclick="() => Navigate(cursor)">@MoveLabel(ply) @(annotation?.Symbol) @(string.IsNullOrWhiteSpace(annotation?.Comment) ? "" : "· note")</button>
+                                }
+                            </div>
+                            @if (!current.Submitted)
+                            {
+                                <div class="button-row">
+                                    <button @onclick='() => Command("branch")'>Branch opponent response</button>
+                                    <button @onclick='() => Command("trim")'>Trim after selected move</button>
+                                    @if (current.LineIndex > 0) { <button @onclick='() => Command("remove")'>Remove variation</button> }
+                                </div>
+                                <label>Enter your line<textarea rows="2" placeholder="e.g. Be6+ Kd8 Qf8#" @bind="notation"></textarea></label>
+                                <button @onclick="AddNotation">Add moves</button>
+                                @if (promotionMove is not null)
+                                {
+                                    <div class="promotion" role="group" aria-label="Choose promotion">
+                                        <span>Promote to</span>
+                                        @foreach (var choice in new[] { ("Queen", "q"), ("Rook", "r"), ("Bishop", "b"), ("Knight", "n") })
+                                        { <button @onclick="() => Promote(choice.Item2)">@choice.Item1</button> }
+                                        <button @onclick="() => promotionMove = null">Cancel</button>
+                                    </div>
+                                }
+                            }
+                            <label>Comment on @(current.Cursor == 0 ? "the starting position" : $"move {current.Cursor}")<textarea rows="3" @bind="comment" @bind:after="SaveAnnotation" placeholder="Your plan, candidate moves, or review notes"></textarea></label>
+                            <label>Annotation<select @bind="symbol" @bind:after="SaveAnnotation">
+                                @foreach (string mark in new[] { "", "!", "?", "!!", "??", "!?", "?!" }) { <option value="@mark">@(mark == "" ? "None" : mark)</option> }
+                            </select></label>
+                            <small class="muted">Comments save when you leave the field, including after submission.</small>
+                            @if (current.Submitted)
+                            {
+                                <section class="review"><h3>Results</h3>
+                                    @foreach (var result in current.Results!) { <p><strong>@result.Name: @result.Verdict</strong><br />@result.Explanation</p> }
+                                    <h3>Reference solution</h3><p>@(string.IsNullOrEmpty(current.Solution) ? "No reference solution. Your analysis is saved as unverified." : current.Solution)</p>
+                                </section>
+                            }
+                        </div>
+                        @if (!current.Submitted)
+                        {
+                            <footer class="submit-footer"><p class="muted">No evaluation until you submit.</p><button class="primary" @onclick="Submit">Submit answer</button></footer>
+                        }
+                    </section>
+                </div>
+            }
+            else { <section class="empty-state"><h2>Calculate before you commit.</h2><p>Move both colors, type your line, or practice visualization with a frozen board. The answer stays hidden until you submit.</p></section> }
+        }
+        else if (page == "Studies")
+        {
+            <h1>Studies</h1><p class="muted">Your positions and notes, shared across devices.</p>
+            <div class="studies-grid">
+                <section class="collection">
+                    <label>Study<select value="@selectedStudy" @onchange="StudyChanged"><option value="">Choose a study</option>
+                        @foreach (var study in studies) { <option value="@study.Id">@study.Name</option> }
+                    </select></label>
+                    <label>Study name<input @bind="studyName" maxlength="200" /></label>
+                    <div class="button-row"><button @onclick="CreateStudy">Create study</button><button disabled="@(selectedStudy is null)" @onclick="RenameStudy">Rename selected study</button></div>
+                    <p class="muted">@positions.Count positions</p>
+                    <div class="position-list">
+                        @foreach (var position in positions)
+                        { <button class="@(editingPosition == position.Id ? "selected" : "")" @onclick="() => EditPosition(position)">@position.Title</button> }
+                    </div>
+                    <button class="primary" disabled="@(editingPosition is null)" @onclick="PracticePosition">Practice selected position</button>
+                    @if (studies.Count > 1)
+                    {
+                        <label>Move selected position to<select @bind="destination"><option value="">Choose destination</option>
+                            @foreach (var study in studies.Where(s => s.Id != selectedStudy)) { <option value="@study.Id">@study.Name</option> }
+                        </select></label>
+                        <button disabled="@(editingPosition is null || destination is null)" @onclick="MovePosition">Move to study</button>
+                    }
+                </section>
+                <section class="position-editor">
+                    <div class="section-heading"><h2>@(editingPosition is null ? "Add a position" : "Edit position")</h2><button @onclick="NewPosition">New position</button></div>
+                    <fieldset class="source-choices"><legend>Import source</legend>
+                        @foreach (string source in new[] { "Paste FEN", "CSV file", "Screenshot (Azure AI)" })
+                        { <button class="@(importSource == source ? "selected" : "")" aria-pressed="@(importSource == source)" @onclick="() => importSource = source">@source</button> }
+                    </fieldset>
+                    @if (importSource == "CSV file")
+                    {
+                        <label>Import positions CSV<InputFile OnChange="ImportCsv" accept=".csv,text/csv" /></label>
+                        <p class="muted">FEN is required; Title, Solution and Notes are optional. The whole file is validated before saving.</p>
+                    }
+                    @if (importSource == "Screenshot (Azure AI)")
+                    {
+                        <p>Choose an image or paste a screenshot. Nothing is uploaded until you choose Generate FEN.</p>
+                        <label>Choose screenshot<input type="file" accept="image/png,image/jpeg,image/webp,image/bmp" onchange="chess.readFile(this)" /></label>
+                        <button @onclick="PasteScreenshot">Paste screenshot</button>
+                        <img id="local-screenshot-preview" class="screenshot-preview" hidden alt="Position screenshot awaiting transcription" />
+                        <label>Screenshot orientation<select @bind="blackAtBottom"><option value="false">White at bottom</option><option value="true">Black at bottom</option></select></label>
+                        <label class="check"><input type="checkbox" @bind="imageConsent" /> Send this image to Azure AI to replace the FEN below. Azure usage charges apply.</label>
+                        <button disabled="@(!screenshotReady || !imageConsent)" @onclick="Recognize">Generate FEN with Azure AI</button>
+                        @if (visionNote is not null) { <p role="status">@visionNote</p> }
+                        <p class="muted">AI returns placement only. Verify side to move, castling, en-passant rights and counters before saving.</p>
+                    }
+                    <label>Position title<input maxlength="200" @bind="positionTitle" /></label>
+                    <label>FEN (all six fields)<textarea rows="3" @bind="positionFen" spellcheck="false"></textarea></label>
+                    <label>Optional reference solution (SAN or UCI; both sides)<textarea rows="2" @bind="solution"></textarea></label>
+                    <label>Starting-position notes<textarea rows="3" @bind="positionNotes"></textarea></label>
+                    @if (aiGenerated) { <label class="check"><input type="checkbox" @bind="fenReviewed" /> I checked the board and all six FEN fields.</label> }
+                    <div class="button-row"><button @onclick="PreviewPosition">Preview FEN board</button><button class="primary" @onclick="SavePosition">@(editingPosition is null ? "Save position to study" : "Save changes")</button></div>
+                    @if (previewFen is not null)
+                    {
+                        <div class="fen-preview"><ChessBoard Fen="@previewFen" ReadOnly="true" PieceSet="@pieces" Light="@Palette.Light" Dark="@Palette.Dark" /><p>@(new ChessPosition(previewFen).WhiteToMove ? "White" : "Black") to move. Preview shown with White at bottom.</p></div>
+                    }
+                </section>
+            </div>
+        }
+        else if (page == "Results")
+        {
+            <div class="section-heading"><h1>Results</h1><button @onclick="RefreshHistory">Refresh</button></div>
+            <p class="muted">Open a draft to continue, or a submitted attempt to review and annotate. Older attempts load in groups of 200.</p>
+            @if (history.Count == 0) { <p>No attempts yet. Start a puzzle in Practice or choose a study position.</p> }
+            <div class="history-list">
+                @foreach (var attempt in history)
+                {
+                    <button @onclick="() => OpenAttempt(attempt.Id)"><strong>@(attempt.IsCustom ? attempt.Title : $"Lichess {attempt.PuzzleId} · Rating {attempt.Rating}")</strong>
+                        <span>@attempt.StartedAt.ToLocalTime().ToString("g") &middot; @attempt.Mode</span><span class="outcome">@attempt.Outcome</span></button>
+                }
+            </div>
+            @if (moreHistory) { <button @onclick="LoadOlderHistory">Load older attempts</button> }
+        }
+        else
+        {
+            <h1>Appearance</h1><p class="muted">Board, pieces and theme are independent preferences, saved to your cloud account.</p>
+            <label class="theme-choice">Application theme<select value="@theme" @onchange="ThemeChanged"><option value="light">Light</option><option value="dark">Dark</option></select></label>
+            <h2>Chess boards</h2><div class="gallery">
+                @foreach (var board in boards)
+                {
+                    <button class="gallery-choice @(boardId == board.Id ? "selected" : "")" aria-pressed="@(boardId == board.Id)" @onclick="() => ChooseBoard(board.Id)">
+                        <span class="board-swatch" style="--square-light:@board.Light;--square-dark:@board.Dark"></span><strong>@board.Name</strong><span>@(boardId == board.Id ? "Selected" : "Choose board")</span></button>
+                }
+            </div>
+            <h2>Chess pieces</h2><div class="piece-gallery">
+                @foreach (string set in pieceSets)
+                {
+                    <button class="gallery-choice @(pieces == set ? "selected" : "")" aria-pressed="@(pieces == set)" @onclick="() => ChoosePieces(set)">
+                        <span class="piece-preview">
+                            @foreach (char color in "wb") { @foreach (char piece in "KQRBNP") { <img src="@($"/pieces/{set}/{color}{piece}.svg")" alt="@($"{color}{piece}")" /> } }
+                        </span><strong>@set</strong><span>@(pieces == set ? "Selected" : "Choose pieces")</span></button>
+                }
+            </div>
+            <section class="install-help"><h2>Use on your phone</h2><p>In Safari, choose Share then Add to Home Screen. In Chrome or Edge, use Install app or Add to Home screen. An internet connection is required for analysis and saving.</p></section>
+            <p><a href="/third-party-notices.txt">Artwork and third-party notices</a> &middot; <a href="/.auth/logout?post_logout_redirect_uri=/" data-enhance-nav="false">Sign out</a></p>
+        }
+        </fieldset>
+    }
+</div>
+
+@code {
+    private ClaimsPrincipal user = new();
+    private string? owner;
+    private bool loading = true, busy, flipped, blackAtBottom, imageConsent, aiGenerated, fenReviewed, moreHistory, screenshotReady;
+    private string page = "Practice", theme = "light", pieces = "chessnut", boardId = "sage";
+    private string? error, message, selectedSquare, promotionMove, visionNote, previewFen;
+    private int minimum = 800, maximum = 2000;
+    private long puzzleCount;
+    private SessionView? current;
+    private string notation = "", comment = "", symbol = "";
+    private IReadOnlyList<Study> studies = [];
+    private IReadOnlyList<StudyPosition> positions = [];
+    private IReadOnlyList<HistoryItem> history = [];
+    private Guid? selectedStudy, editingPosition, destination;
+    private string studyName = "", positionTitle = "", positionFen = "", solution = "", positionNotes = "", importSource = "Paste FEN";
+    private DotNetObjectReference<Home>? reference;
+    private bool jsInitialized;
+    private AnalysisLine ActiveLine => current!.Lines[current.LineIndex];
+    private static readonly string[] pieceSets = ["chessnut", "celtic", "spatial", "fantasy", "rhosgfx"];
+    private sealed record BoardPalette(string Id, string Name, string Light, string Dark);
+    private static readonly BoardPalette[] boards = [
+        new("sage","Sage","#EAEDDC","#84A089"), new("walnut","Walnut","#F0D9B5","#B58863"),
+        new("slate","Slate","#DEE3E6","#788A96"), new("sand","Sand","#F4E9D2","#C2A678"),
+        new("ocean","Ocean","#DCEAF0","#6395AD"), new("rose","Rose","#F0E0DC","#B5838D")];
+    private BoardPalette Palette => boards.First(b => b.Id == boardId);
+
+    protected override async Task OnInitializedAsync()
+    {
+        user = (await Authentication.GetAuthenticationStateAsync()).User;
+        if (user.Identity?.IsAuthenticated == true)
+        {
+            await Run(async () =>
+            {
+                owner = Access.Owner(user);
+                puzzleCount = await Store.PuzzleCountAsync();
+                studies = await Store.StudiesAsync(owner);
+                theme = await Store.SettingAsync(owner, "theme") == "dark" ? "dark" : "light";
+                string? board = await Store.SettingAsync(owner, "board-set"), set = await Store.SettingAsync(owner, "piece-set");
+                boardId = boards.Any(b => b.Id == board) ? board! : "sage";
+                pieces = pieceSets.Contains(set) ? set! : "chessnut";
+                history = await Store.HistoryAsync(owner);
+                moreHistory = history.Count == 200;
+                if (history.FirstOrDefault(h => h.SubmittedAt is null) is { } draft) SetCurrent(await Training.ReadAsync(user, draft.Id));
+            });
+        }
+        loading = false;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!jsInitialized)
+        {
+            reference = DotNetObjectReference.Create(this);
+            await JS.InvokeVoidAsync("chess.connect", reference);
+            jsInitialized = true;
+        }
+        if (page == "Studies" && importSource == "Screenshot (Azure AI)")
+            await JS.InvokeVoidAsync(screenshotReady ? "chess.showScreenshot" : "chess.clearScreenshot");
+    }
+
+    private async Task Run(Func<Task> action)
+    {
+        if (busy) return;
+        busy = true; error = null; message = null;
+        try { await action(); }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Trainer operation failed.");
+            error = ex is ArgumentException or InvalidOperationException or InvalidDataException or KeyNotFoundException or UnauthorizedAccessException or JSException
+                ? ex.Message : "The operation could not be completed. Reload to check the saved state before trying again.";
+        }
+        finally { busy = false; }
+    }
+
+    private async Task ChangePage(string tab)
+    {
+        if (busy) return;
+        if (!string.IsNullOrWhiteSpace(notation)) { error = "Add or clear pending notation before changing pages."; return; }
+        await Run(async () =>
+        {
+            if (tab == "Results") await ReadHistory();
+            if (tab == "Studies") studies = await Store.StudiesAsync(owner!);
+            page = tab;
+        });
+    }
+
+    private void SetCurrent(SessionView view)
+    {
+        current = view; selectedSquare = null; promotionMove = null;
+        var note = ActiveLine.Annotations.GetValueOrDefault(view.Cursor);
+        comment = note?.Comment ?? ""; symbol = note?.Symbol ?? "";
+    }
+    private async Task NextPuzzle() => await Run(async () =>
+    {
+        if (!string.IsNullOrWhiteSpace(notation)) throw new InvalidOperationException("Add or clear pending notation first.");
+        SetCurrent(await Training.StartAsync(user, new(minimum, maximum, current?.IsCustom == false ? current.PuzzleId : null, Mode: current?.Mode ?? SolveMode.Board)));
+        flipped = !new ChessPosition(current!.StartingFen).WhiteToMove;
+    });
+    private string MoveLabel(int ply)
+    {
+        var start = new ChessPosition(current!.StartingFen);
+        int number = start.MoveNumber + (ply - 1 + (start.WhiteToMove ? 0 : 1)) / 2;
+        bool white = (ply % 2 == 1) == start.WhiteToMove;
+        return $"{number}{(white ? "." : "...")} {ActiveLine.San[ply - 1]}";
+    }
+    private async Task Apply(string action, string value = "", int? cursor = null, int? line = null, string mark = "")
+    {
+        if (current is null) return;
+        SetCurrent(await Training.ApplyAsync(user, current.Id, new(action, current.Revision, line ?? current.LineIndex,
+            cursor ?? current.Cursor, value, mark)));
+    }
+    private Task Command(string action) => Run(() => Apply(action));
+    private Task Navigate(int cursor) => Run(() => Apply("navigate", cursor: Math.Clamp(cursor, 0, ActiveLine.Moves.Count)));
+    private Task ModeChanged(ChangeEventArgs args) => Run(() => Apply("mode", args.Value!.ToString()!));
+    private Task LineChanged(ChangeEventArgs args) => Run(() =>
+    {
+        int index = int.Parse(args.Value!.ToString()!);
+        return Apply("navigate", cursor: current!.Lines[index].Moves.Count, line: index);
+    });
+    private Task AddNotation() => Run(async () => { await Apply("notation", notation); notation = ""; });
+    private Task Submit() => Run(async () =>
+    {
+        if (!string.IsNullOrWhiteSpace(notation)) throw new InvalidOperationException("Add or clear pending notation before submitting.");
+        await Apply("submit");
+    });
+    private Task SaveAnnotation() => Run(() => Apply("annotation", comment, mark: symbol));
+    private async Task SquareClicked(string square)
+    {
+        if (busy || current is null || current.Submitted || current.Mode != SolveMode.Board) return;
+        await Run(async () =>
+        {
+            var board = new ChessPosition(current.Fen);
+            char piece = board.PieceAt(square);
+            if (selectedSquare is null || (piece != ' ' && char.IsUpper(piece) == board.WhiteToMove))
+            {
+                if (piece == ' ' || char.IsUpper(piece) != board.WhiteToMove) throw new InvalidOperationException("Select a piece belonging to the side to move.");
+                selectedSquare = square; return;
+            }
+            string move = selectedSquare + square;
+            char moving = board.PieceAt(selectedSquare);
+            if (char.ToUpperInvariant(moving) == 'P' && square[1] is '1' or '8') { promotionMove = move; return; }
+            await Apply("uci", move);
+        });
+    }
+    private Task Promote(string piece) => Run(() => Apply("uci", promotionMove + piece));
+    private async Task ReadHistory()
+    {
+        history = await Store.HistoryAsync(owner!);
+        moreHistory = history.Count == 200;
+    }
+    private Task RefreshHistory() => Run(ReadHistory);
+    private Task LoadOlderHistory() => Run(async () =>
+    {
+        var older = await Store.HistoryAsync(owner!, history.Count);
+        history = history.Concat(older).DistinctBy(h => h.Id).ToArray();
+        moreHistory = older.Count == 200;
+    });
+    private Task OpenAttempt(Guid id) => Run(async () =>
+    {
+        if (!string.IsNullOrWhiteSpace(notation)) throw new InvalidOperationException("Add or clear pending notation in Practice first.");
+        SetCurrent(await Training.ReadAsync(user, id)); page = "Practice";
+    });
+    private Task CreateStudy() => Run(async () =>
+    {
+        var study = new Study(Guid.NewGuid(), studyName);
+        await Store.SaveStudyAsync(owner!, study, true); studies = await Store.StudiesAsync(owner!);
+        selectedStudy = study.Id; studyName = ""; positions = []; NewPosition();
+    });
+    private Task RenameStudy() => Run(async () =>
+    {
+        await Store.SaveStudyAsync(owner!, new(RequireStudy(), studyName), false);
+        studies = await Store.StudiesAsync(owner!); studyName = "";
+    });
+    private Guid RequireStudy() => selectedStudy ?? throw new InvalidOperationException("Create or select a study first.");
+    private Task StudyChanged(ChangeEventArgs args) => Run(async () =>
+    {
+        selectedStudy = Guid.TryParse(args.Value?.ToString(), out var id) ? id : null;
+        positions = selectedStudy is Guid study ? await Store.PositionsAsync(owner!, study) : [];
+        NewPosition();
+    });
+    private void NewPosition()
+    {
+        editingPosition = null; positionTitle = positionFen = solution = positionNotes = "";
+        previewFen = visionNote = null; aiGenerated = fenReviewed = imageConsent = screenshotReady = false; destination = null;
+    }
+    private void EditPosition(StudyPosition position)
+    {
+        NewPosition(); editingPosition = position.Id; positionTitle = position.Title; positionFen = position.Fen;
+        solution = position.Solution; positionNotes = position.Notes;
+    }
+    private Task SavePosition() => Run(async () =>
+    {
+        if (aiGenerated && !fenReviewed) throw new InvalidOperationException("Check the AI-generated FEN and confirm its review before saving.");
+        var position = StudyPosition.Create(RequireStudy(), positionTitle, positionFen, solution, positionNotes);
+        bool create = editingPosition is null;
+        position = position with { Id = editingPosition ?? position.Id };
+        await Store.SavePositionsAsync(owner!, position.StudyId, [position], create);
+        editingPosition = position.Id;
+        positions = await Store.PositionsAsync(owner!, position.StudyId); EditPosition(position);
+        message = "Position saved to your study.";
+    });
+    private Task PracticePosition() => Run(async () =>
+    {
+        if (!string.IsNullOrWhiteSpace(notation)) throw new InvalidOperationException("Add or clear pending notation in Practice first.");
+        SetCurrent(await Training.StartAsync(user, new(PositionId: editingPosition, Mode: current?.Mode ?? SolveMode.Board)));
+        flipped = !new ChessPosition(current!.StartingFen).WhiteToMove; page = "Practice";
+    });
+    private Task MovePosition() => Run(async () =>
+    {
+        if (editingPosition is not Guid id || destination is not Guid target) throw new InvalidOperationException("Select a position and destination.");
+        var position = await Store.PositionAsync(owner!, id);
+        await Store.SavePositionsAsync(owner!, target, [position], false);
+        positions = await Store.PositionsAsync(owner!, RequireStudy()); NewPosition();
+    });
+    private Task ImportCsv(InputFileChangeEventArgs args) => Run(async () =>
+    {
+        Guid study = RequireStudy();
+        await using var memory = new MemoryStream();
+        await args.File.OpenReadStream(5 * 1024 * 1024).CopyToAsync(memory);
+        memory.Position = 0;
+        var imported = StudyPosition.ReadCsv(memory, study);
+        await Store.SavePositionsAsync(owner!, study, imported, true);
+        positions = await Store.PositionsAsync(owner!, study); message = $"Imported {imported.Count} positions.";
+    });
+    private Task PreviewPosition() => Run(() => { previewFen = StudyPosition.ValidateFen(positionFen); return Task.CompletedTask; });
+    private async Task PasteScreenshot()
+    {
+        try { await JS.InvokeVoidAsync("chess.paste"); }
+        catch (JSException ex) { Logger.LogWarning(ex, "Clipboard access failed."); error = ex.Message; }
+    }
+    [JSInvokable] public Task ScreenshotReady() => Run(() =>
+    {
+        screenshotReady = true; imageConsent = false; visionNote = "Screenshot ready. Confirm the orientation before generating FEN.";
+        StateHasChanged(); return Task.CompletedTask;
+    });
+    [JSInvokable] public Task ImageError(string text) { error = text; StateHasChanged(); return Task.CompletedTask; }
+    private Task Recognize() => Run(async () =>
+    {
+        if (!imageConsent || !screenshotReady) throw new InvalidOperationException("Choose a screenshot and confirm the upload first.");
+        string png = await JS.InvokeAsync<string>("chess.getScreenshot");
+        var result = await Vision.RecognizeAsync(user, new(png, blackAtBottom));
+        positionFen = $"{result.Placement} w - - 0 1"; aiGenerated = true; fenReviewed = false;
+        visionNote = "FEN generated. Review it before saving. " + result.Uncertainties;
+    });
+    private Task ThemeChanged(ChangeEventArgs args) => Run(async () =>
+    {
+        theme = args.Value!.ToString()!; await Store.SaveSettingAsync(owner!, "theme", theme);
+    });
+    private Task ChooseBoard(string id) => Run(async () => { await Store.SaveSettingAsync(owner!, "board-set", id); boardId = id; });
+    private Task ChoosePieces(string set) => Run(async () => { await Store.SaveSettingAsync(owner!, "piece-set", set); pieces = set; });
+    public async ValueTask DisposeAsync()
+    {
+        if (reference is not null)
+        {
+            try { await JS.InvokeVoidAsync("chess.disconnect"); }
+            catch (JSDisconnectedException) { }
+            reference.Dispose();
+        }
+    }
+}

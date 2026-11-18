@@ -1,6 +1,6 @@
 # Chess Trainer
 
-A native **WinUI 3 / C#** desktop app for deliberate chess calculation. Single user, local SQLite storage, no login.
+A **WinUI 3 / C#** desktop app and a responsive **Blazor web/mobile app** for deliberate chess calculation. The desktop app uses local SQLite without login. The cloud edition shares its library, studies and results across browsers and phones, protected by owner-restricted Microsoft sign-in.
 
 ## Run
 
@@ -18,6 +18,78 @@ Create a portable release:
 dotnet publish src\ChessTrainer.App -c Release -p:Platform=x64 -o artifacts\ChessTrainer
 .\artifacts\ChessTrainer\ChessTrainer.App.exe
 ```
+
+## Web and mobile
+
+`src\ChessTrainer.Web` is an installable, online-first web app, not a separate native iOS/Android binary. It reuses the desktop chess engine and supports all three practice modes, variations, annotations, results, editable studies, FEN/CSV/screenshot imports, and the same piece/board/theme galleries. On iPhone/iPad use Safari's **Share > Add to Home Screen**; Chrome/Edge offer **Install app** or **Add to Home screen**.
+
+The server runs chess logic and grading. Practice responses do not contain the reference solution or grading before submission. Browsers and phones use a shared Azure SQL database; screenshot transcription uses the existing keyless Azure AI deployment. The service worker does not cache private pages, API responses or answers. An internet connection is required, including after installation.
+
+**Desktop data is copied, not continuously synchronized.** Migration leaves the original database untouched. Subsequent Windows-app edits stay local; subsequent web/mobile edits are shared between cloud devices. The WinUI app has not been switched to the cloud API.
+
+### Local web development
+
+Install the .NET 10 SDK. This explicit development-only identity bypass must never be enabled on an exposed server. Use a separate database, not the desktop database:
+
+```powershell
+$env:ASPNETCORE_ENVIRONMENT = 'Development'
+$env:Storage__SqlitePath = "$PWD\artifacts\cloud\development.db"
+$env:Authentication__DevelopmentIdentity = 'true'
+$env:Authentication__OwnerId = '11111111-1111-1111-1111-111111111111'
+$env:Authentication__TenantId = '22222222-2222-2222-2222-222222222222'
+New-Item -ItemType Directory -Force artifacts\cloud | Out-Null
+dotnet run --project src\ChessTrainer.Web --no-launch-profile -- --task initialize
+dotnet run --project src\ChessTrainer.Web --no-launch-profile -- --task migrate --source-db "$env:LOCALAPPDATA\ChessTrainer\trainer.db" --puzzle-limit 10000
+dotnet run --project src\ChessTrainer.Web --no-launch-profile --urls http://localhost:5097
+```
+
+The bounded copy includes up to 10,000 puzzles plus studies, positions, history and appearance settings. Remove `--puzzle-limit` only when intentionally copying the full dataset. If the desktop app has not been run, create its database first using the Windows instructions above. Local image recognition additionally requires `Vision__Endpoint`, `Vision__Deployment` and an Azure CLI identity with inference permission.
+
+### Azure deployment
+
+`infra\Deploy-Web.ps1` provisions a dedicated resource group with VNet-integrated Azure Container Apps Consumption, a private Basic container registry, a user-assigned managed identity, an Entra-only Azure SQL server/database, a SQL private endpoint/private DNS zone, and a single-tenant Microsoft sign-in registration. SQL public network access stays disabled, including when subscription policy enforces that setting. The app identity receives SQL data access and resource-scoped inference access to the existing `rg-chess-trainer-ai` model; SQL passwords and model keys are not used.
+
+Run from a fresh PowerShell session with an appropriately privileged Azure CLI account. The selected subscription must permit resource creation, role assignment, required network-feature registration and app registration. The script registers `Microsoft.Network/AllowBringYourOwnPublicIpAddress` when needed by Container Apps infrastructure; subscriptions requiring feature approval must finish that approval before deployment. SQL and Container Apps region availability are independent; `-SqlLocation` and `-SqlServerName` allow a different SQL region/name when provisioning is restricted.
+
+```powershell
+.\infra\Deploy-Web.ps1 -ProvisionOnly
+.\infra\Deploy-Web.ps1 -DeployOnly -LocalDatabase "$env:LOCALAPPDATA\ChessTrainer\trainer.db"
+```
+
+Provisioning records non-secret resource identities and the URL in ignored `artifacts\cloud\deployment.json`. Deployment publishes Linux containers without requiring Docker. A short-lived Container Apps job initializes the database and copies data from inside the VNet; the developer machine does not need public SQL access or a VPN.
+
+For migration, SQLite's backup API creates a consistent snapshot, including committed WAL data, without writing to the original database. The snapshot is temporarily included in a private ACR migration image, never in the web-serving image or source control. A separate bootstrap identity temporarily becomes SQL Entra administrator, creates the schema and grants the runtime identity only SELECT/INSERT/UPDATE. The script restores the provisioning user's SQL administrator role and the normal S0 tier in `finally`. Successful bootstraps remove their job, identity, registry image and local database snapshot. Failed jobs/images remain for diagnostics; they are private and must be removed after troubleshooting.
+
+Migration processes 50,000-puzzle batches and prints progress in the bootstrap job's console logs. Puzzle IDs use binary, case-sensitive SQL collation, preserving distinct Lichess IDs. Reruns upsert puzzles, add missing study/position/attempt IDs and preserve existing cloud edits and settings. A failed migration can leave earlier cloud batches committed; rerun to finish. Back up the source first as usual.
+
+After the initial copy, omit `-LocalDatabase` for ordinary deployments. Bootstrap grants use the managed identity's **client ID** for its contained SQL user SID; Azure role assignments and SQL administrator configuration use its **object ID**. Replacing the runtime identity recreates only its named SQL access principal and reapplies the restricted grants, not application tables or saved data.
+
+Exact per-rating counts are maintained transactionally by database triggers. Random selection weights each rating by its puzzle count, then reads an offset within that rating, preserving uniform selection without repeatedly scanning millions of rows on the S0 database. Existing cloud libraries receive a one-time count backfill during initialization.
+
+**Costs and operating limits:** Azure SQL S0 (250 GB maximum), ACR Basic, the private endpoint/private DNS and applicable VNet infrastructure have standing charges even while idle. Full migrations temporarily use SQL S3 and a 1 CPU / 2 GiB bootstrap job, then return to S0. Container Apps scales from zero to one web replica (0.5 CPU / 1 GiB); requests and AI inference may incur additional usage charges. Prices depend on region and subscription. No custom domain or paid monitoring workspace is provisioned. Console diagnostics are available through Container Apps; durable centralized log retention is not configured. If deployment is forcibly terminated, verify that the SQL administrator and S0 tier have been restored; a terminated shell cannot guarantee cleanup.
+
+Blazor uses server-side interactive circuits. Cold starts and reconnects are expected; saved drafts survive server restarts, while unsaved text can be lost. One replica is intentional; scaling to multiple replicas requires a circuit/session strategy. Results load 200 attempts at a time; **Load older attempts** keeps earlier history accessible. The Easy Auth client secret expires after one year; rerunning provisioning renews it when fewer than 30 days remain.
+
+Microsoft sign-in is required before entering the cloud workspace. Public health endpoints and installation/static assets contain no personal data. Easy Auth validates sign-in, and the application additionally checks both the configured tenant and owner object IDs. The original login-free requirement remains unchanged for local Windows use.
+
+### API
+
+JSON endpoints under `/api` require the owner's authenticated session. Writes also require `X-ChessTrainer-Request: 1`; cross-origin access is not enabled. The browser UI uses the same server application services directly over its authenticated Blazor circuit.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/me` | Owner and puzzle count |
+| `POST /api/attempts` | Start a random rating-filtered puzzle or study position |
+| `GET /api/attempts?offset=0&limit=200`, `GET /api/attempts/{id}` | Paginated history or a sanitized practice/review snapshot |
+| `POST /api/attempts/{id}/commands` | Notation, board moves, variations, navigation, notes, mode or submission |
+| `GET/POST /api/studies`, `PUT /api/studies/{id}` | List/create/rename studies |
+| `GET/POST /api/studies/{id}/positions`, `PUT /api/positions/{id}` | List/import/edit positions |
+| `GET/PUT /api/settings/{name}` | Theme, board and piece preferences |
+| `POST /api/vision` | Explicitly requested PNG-to-FEN transcription |
+
+Attempt commands include the last numeric `revision`; stale edits return HTTP 409 instead of silently overwriting another device's changes. Position saves overwrite in place, without user-facing study versioning. The API limits requests to 120/minute per user/IP; image transcription is additionally limited to 20/hour per owner per running process.
+
+`GET /health` checks the process; `GET /health/ready` checks database connectivity/schema. Neither is proof that sign-in or image transcription is working. Configure Microsoft sign-in through the hosting platform; do not expose the container directly behind a proxy that accepts client-supplied identity headers.
 
 ## Practice
 
@@ -118,7 +190,7 @@ dotnet build ChessTrainer.sln -p:Platform=x64
 dotnet test tests\ChessTrainer.Tests
 ```
 
-Tests cover chess legality, setup semantics, all three modes, hidden grading, variations, alternate mates, atomic notation input, rating filtering, compressed import, rollback, study imports/organization, FEN validation, ungraded positions, annotations and immutable snapshots, legacy JSON compatibility, persistent draft/result round trips, and the authenticated vision request/response contract. The separate VerifyVision tool checks actual Azure inference rather than a mock.
+Tests cover chess legality, setup semantics, all three modes, hidden grading, variations, alternate mates, atomic notation input, rating filtering, compressed import, rollback, study imports/organization, FEN validation, ungraded positions, annotations and immutable snapshots, legacy JSON compatibility, persistent draft/result round trips, and the authenticated vision request/response contract. Cloud integration tests additionally cover answer withholding, frozen-board practice, stale-device conflicts, ownership, forged headers, write protection, repeatable read-only migration, atomic position batches and real SVG delivery. These tests use SQLite and do not replace live SQL/managed-identity deployment checks. The separate VerifyVision tool checks actual Azure inference rather than a mock.
 
 Refresh the bundled CC0 sample from the first 2,000 records of the current archive:
 
