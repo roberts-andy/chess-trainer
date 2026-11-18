@@ -1,6 +1,7 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [switch]$Apply,
+    [switch]$RetentionOnly,
     [string]$SubscriptionId,
     [string]$ResourceGroup = 'rg-chess-trainer-cloud',
     [string]$EnvironmentName = 'chess-trainer-cloud-environment',
@@ -16,10 +17,13 @@ param(
 . "$PSScriptRoot\Operations.Common.ps1"
 
 if (-not $Apply) {
+    $required = @('SubscriptionId', 'AppName', 'SqlServerName', 'VisionResourceId',
+        'WorkspaceResourceId', 'ExpectedRetentionDays')
+    if (-not $RetentionOnly) { $required += 'NotificationEmail' }
     [ordered]@{
         Mode = 'PlanOnly'
-        Requires = @('SubscriptionId', 'AppName', 'SqlServerName', 'VisionResourceId',
-            'WorkspaceResourceId', 'ExpectedRetentionDays', 'NotificationEmail')
+        Requires = $required
+        NotificationControls = if ($RetentionOnly) { 'Deferred; no action group or alert rules' } else { 'Require owner recipient' }
         Changes = @('Reuse an existing workspace with owner-approved retention; never change shared retention',
             'Route environment console/system logs through Azure Monitor',
             'Create a dedicated owner action group and passive app/SQL/vision metric alerts')
@@ -30,7 +34,7 @@ if (-not $Apply) {
 }
 
 Assert-OperationsSubscription $SubscriptionId
-Assert-OperationsEmail $NotificationEmail
+if (-not $RetentionOnly) { Assert-OperationsEmail $NotificationEmail }
 if (-not $AppName -or -not $SqlServerName -or -not $VisionResourceId) {
     throw 'Apply requires AppName, SqlServerName and the exact VisionResourceId.'
 }
@@ -66,26 +70,49 @@ if ($null -ne $environment.properties.appLogsConfiguration -and
 }
 $groups = @(Invoke-OperationsAz @('monitor', 'action-group', 'list', '-g', $ResourceGroup, '--subscription', $SubscriptionId))
 $groupName = 'chess-trainer-operations'
-if (@($groups | Where-Object { $null -ne $_ -and $_.name -eq $groupName }).Count) {
+if (-not $RetentionOnly -and @($groups | Where-Object { $null -ne $_ -and $_.name -eq $groupName }).Count) {
     throw 'The managed action-group name already exists. Review existing coverage rather than overwriting receivers.'
 }
 $settings = @(Invoke-OperationsAz @('monitor', 'diagnostic-settings', 'list', '--resource', $environmentId, '--subscription', $SubscriptionId))
-if (@($settings | Where-Object { $null -ne $_ -and $_.name -eq 'chess-trainer-logs' }).Count) {
-    throw 'The managed diagnostic setting already exists. Review/reuse its destination instead of overwriting it.'
+$managedSettings = @($settings | Where-Object { $null -ne $_ -and $_.name -eq 'chess-trainer-logs' })
+$reuseSetting = $managedSettings.Count -eq 1
+if ($managedSettings.Count -gt 1) { throw 'Multiple managed diagnostic settings were returned.' }
+if ($reuseSetting) {
+    $setting = $managedSettings[0]
+    $destination = $setting.PSObject.Properties['workspaceId']
+    if ($null -eq $destination -or $destination.Value -ne $WorkspaceResourceId) {
+        throw 'The managed diagnostic setting has a different destination; refusing to overwrite it.'
+    }
+    foreach ($name in @('storageAccountId', 'eventHubAuthorizationRuleId', 'serviceBusRuleId', 'marketplacePartnerId')) {
+        $extra = $setting.PSObject.Properties[$name]
+        if ($null -ne $extra -and $extra.Value) { throw 'The managed setting has additional destinations; review it separately.' }
+    }
+    $categories = @($setting.logs | Where-Object enabled | ForEach-Object category | Sort-Object)
+    if (($categories -join ',') -ne 'ContainerAppConsoleLogs,ContainerAppSystemLogs') {
+        throw 'The managed setting has different log categories; review it separately.'
+    }
 }
 $managedRuleNames = @('chess-trainer-http-errors', 'chess-trainer-restarts',
     'chess-trainer-sql-connections', 'chess-trainer-vision-errors')
 $existingRules = @(Invoke-OperationsAz @('monitor', 'metrics', 'alert', 'list', '-g', $ResourceGroup, '--subscription', $SubscriptionId))
-if (@($existingRules | Where-Object { $null -ne $_ -and $_.name -in $managedRuleNames }).Count) {
+if (-not $RetentionOnly -and @($existingRules | Where-Object { $null -ne $_ -and $_.name -in $managedRuleNames }).Count) {
     throw 'A managed metric-alert name already exists. Review/reuse its scope and recipients rather than overwriting it.'
 }
-if (-not $PSCmdlet.ShouldProcess($ResourceGroup, 'Configure retained logs and passive owner alerts (may incur Azure Monitor charges)')) { return }
+if (-not $PSCmdlet.ShouldProcess($ResourceGroup, 'Configure selected retained logs/notifications (may incur Azure Monitor charges)')) { return }
 
-Invoke-OperationsAz @('containerapp', 'env', 'update', '-g', $ResourceGroup, '-n', $EnvironmentName,
-    '--logs-destination', 'azure-monitor', '--subscription', $SubscriptionId) | Out-Null
-Invoke-OperationsAz @('monitor', 'diagnostic-settings', 'create', '-n', 'chess-trainer-logs', '--resource', $environmentId,
-    '--workspace', $WorkspaceResourceId, '--logs', '[{"category":"ContainerAppConsoleLogs","enabled":true},{"category":"ContainerAppSystemLogs","enabled":true}]',
-    '--subscription', $SubscriptionId) | Out-Null
+if ($environment.properties.appLogsConfiguration.destination -ne 'azure-monitor') {
+    Invoke-OperationsAz @('containerapp', 'env', 'update', '-g', $ResourceGroup, '-n', $EnvironmentName,
+        '--logs-destination', 'azure-monitor', '--subscription', $SubscriptionId) | Out-Null
+}
+if (-not $reuseSetting) {
+    Invoke-OperationsAz @('monitor', 'diagnostic-settings', 'create', '-n', 'chess-trainer-logs', '--resource', $environmentId,
+        '--workspace', $WorkspaceResourceId, '--logs', '[{"category":"ContainerAppConsoleLogs","enabled":true},{"category":"ContainerAppSystemLogs","enabled":true}]',
+        '--subscription', $SubscriptionId) | Out-Null
+}
+if ($RetentionOnly) {
+    Write-Output 'Retained logging configured. Notification delivery and alert rules are not configured in RetentionOnly mode.'
+    return
+}
 $action = Invoke-OperationsAz @('monitor', 'action-group', 'create', '-g', $ResourceGroup, '-n', $groupName,
     '--short-name', 'ChessTrainer', '--action', 'email', 'owner', $NotificationEmail, '--subscription', $SubscriptionId)
 $rules = @(

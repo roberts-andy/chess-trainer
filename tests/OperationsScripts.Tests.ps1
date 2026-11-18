@@ -9,7 +9,7 @@ $credentialId = '22222222-2222-2222-2222-222222222222'
 $global:ChessOperationsTestState = @{
     Calls = [Collections.Generic.List[object]]::new()
     Expired = $false; BudgetExists = $false; AllowAz = $false
-    Base = $base; CredentialId = $credentialId
+    Base = $base; CredentialId = $credentialId; Workspace = $workspace; ManagedSinkExists = $false
 }
 
 function Assert-That([bool]$Condition, [string]$Message) {
@@ -33,7 +33,14 @@ function az {
         'containerapp list *' { @(@{ id = "$($global:ChessOperationsTestState.Base)/providers/Microsoft.App/containerApps/trainer"; environment = "$($global:ChessOperationsTestState.Base)/providers/Microsoft.App/managedEnvironments/chess-trainer-cloud-environment" }); break }
         'containerapp env show *' { @{ properties = @{ appLogsConfiguration = @{ destination = 'none' } } }; break }
         'monitor action-group list *' { @(); break }
-        'monitor diagnostic-settings list *' { @(); break }
+        'monitor diagnostic-settings list *' {
+            if ($global:ChessOperationsTestState.ManagedSinkExists) {
+                @(@{ name = 'chess-trainer-logs'; workspaceId = $global:ChessOperationsTestState.Workspace; logs = @(
+                    @{ category = 'ContainerAppConsoleLogs'; enabled = $true },
+                    @{ category = 'ContainerAppSystemLogs'; enabled = $true }) })
+            } else { @() }
+            break
+        }
         'monitor metrics alert list *' { @(); break }
         'monitor action-group create *' { @{ id = "$($global:ChessOperationsTestState.Base)/providers/Microsoft.Insights/actionGroups/chess-trainer-operations" }; break }
         '*--method GET *Microsoft.Consumption/budgets*' {
@@ -62,10 +69,19 @@ $monitorParameters = @{
     SqlServerName = 'sql'; VisionResourceId = $vision; WorkspaceResourceId = $workspace
     ExpectedRetentionDays = 30; NotificationEmail = 'owner@example.invalid'
 }
+$retentionParameters = $monitorParameters.Clone()
+$retentionParameters.Remove('NotificationEmail')
+$retentionMessage = & "$root\infra\Configure-Monitoring.ps1" @retentionParameters -RetentionOnly
+Assert-That ($retentionMessage -like '*not configured*') 'Retention-only mode must explicitly report missing notification controls.'
+Assert-That (-not @($global:ChessOperationsTestState.Calls | Where-Object {
+    ($_.Arguments -join ' ') -match 'action-group create|metrics alert create' }).Count) 'Retention-only must not invent recipients or create alert rules.'
+$global:ChessOperationsTestState.ManagedSinkExists = $true
 $message = & "$root\infra\Configure-Monitoring.ps1" @monitorParameters
 Assert-That ($message -notmatch 'owner@example') 'Monitor output must not echo the recipient.'
 $alerts = @($global:ChessOperationsTestState.Calls | Where-Object { ($_.Arguments -join ' ') -like 'monitor metrics alert create *' })
 Assert-That ($alerts.Count -eq 4) 'Expected passive app, restart, SQL and vision alerts.'
+Assert-That (@($global:ChessOperationsTestState.Calls | Where-Object {
+    ($_.Arguments -join ' ') -like 'monitor diagnostic-settings create *' }).Count -eq 1) 'Adding notifications must reuse the verified retained-log setting.'
 Assert-That (-not @($global:ChessOperationsTestState.Calls | Where-Object { ($_.Arguments -join ' ') -match 'workspace create|/health|connection-string' }).Count) 'No paid workspace creation or application/SQL probing.'
 
 $budgetParameters = @{
