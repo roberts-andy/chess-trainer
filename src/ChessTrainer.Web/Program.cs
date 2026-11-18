@@ -12,6 +12,8 @@ using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Extensions.FileProviders;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Logging.ClearProviders();
+builder.Logging.AddPrivacySafeConsole();
 if (!builder.Environment.IsDevelopment() && !string.IsNullOrEmpty(builder.Configuration["Storage:SqlitePath"]))
     throw new InvalidOperationException("SQLite storage is only supported for local development.");
 builder.Services.AddSingleton<TokenCredential>(_ =>
@@ -39,38 +41,54 @@ builder.Services.AddRateLimiter(options =>
         context.User.FindFirstValue("oid") ?? context.Connection.RemoteIpAddress?.ToString() ?? "anonymous",
         _ => new FixedWindowRateLimiterOptions { PermitLimit = 120, Window = TimeSpan.FromMinutes(1), QueueLimit = 0 }));
 });
-var app = builder.Build();
-if (builder.Configuration["task"] is string task)
+WebApplication app;
+try { app = builder.Build(); }
+catch
 {
-    if (task == "snapshot")
-    {
-        long count = LocalMigration.CreateSnapshot(
-            builder.Configuration["source-db"] ?? throw new ArgumentException("Specify --source-db."),
-            builder.Configuration["destination-db"] ?? throw new ArgumentException("Specify --destination-db."));
-        Console.WriteLine($"Created a consistent read-only source snapshot: {count:N0} puzzles.");
-        return;
-    }
-    var store = app.Services.GetRequiredService<CloudStore>();
-    await store.InitializeAsync();
-    if (task == "bootstrap")
-    {
-        if (builder.Configuration["Bootstrap:SourceDatabase"] is string source)
-            await LocalMigration.ImportAsync(store,
-                builder.Configuration["Authentication:OwnerId"] ?? throw new ArgumentException("Set the owner ID."), source);
-        await store.GrantApplicationAsync(
-            builder.Configuration["Bootstrap:ApplicationName"] ?? throw new ArgumentException("Set the application name."),
-            Guid.Parse(builder.Configuration["Bootstrap:ClientId"] ?? throw new ArgumentException("Set the application client ID.")));
-    }
-    else if (task == "migrate")
-        await LocalMigration.ImportAsync(store, builder.Configuration["Authentication:OwnerId"] ?? throw new InvalidOperationException("Set the owner ID."),
-            builder.Configuration["source-db"] ?? throw new InvalidOperationException("Specify --source-db."),
-            int.TryParse(builder.Configuration["puzzle-limit"], out int limit) && limit > 0 ? limit : null);
-    else if (task == "grant")
-        await store.GrantApplicationAsync(builder.Configuration["application-name"]!, Guid.Parse(builder.Configuration["client-id"]!));
-    else if (task != "initialize") throw new ArgumentException("Unknown setup task.");
-    Console.WriteLine($"Cloud database ready: {await store.PuzzleCountAsync():N0} puzzles.");
+    Console.Error.WriteLine("Web startup failed while building the host.");
+    Environment.ExitCode = 1;
     return;
 }
+if (builder.Configuration["task"] is string task)
+{
+    try
+    {
+        if (task == "snapshot")
+        {
+            long count = LocalMigration.CreateSnapshot(
+                builder.Configuration["source-db"] ?? throw new ArgumentException("Specify --source-db."),
+                builder.Configuration["destination-db"] ?? throw new ArgumentException("Specify --destination-db."));
+            Console.WriteLine($"Created a consistent read-only source snapshot: {count:N0} puzzles.");
+            return;
+        }
+        var store = app.Services.GetRequiredService<CloudStore>();
+        await store.InitializeAsync();
+        if (task == "bootstrap")
+        {
+            if (builder.Configuration["Bootstrap:SourceDatabase"] is string source)
+                await LocalMigration.ImportAsync(store,
+                    builder.Configuration["Authentication:OwnerId"] ?? throw new ArgumentException("Set the owner ID."), source);
+            await store.GrantApplicationAsync(
+                builder.Configuration["Bootstrap:ApplicationName"] ?? throw new ArgumentException("Set the application name."),
+                Guid.Parse(builder.Configuration["Bootstrap:ClientId"] ?? throw new ArgumentException("Set the application client ID.")));
+        }
+        else if (task == "migrate")
+            await LocalMigration.ImportAsync(store, builder.Configuration["Authentication:OwnerId"] ?? throw new InvalidOperationException("Set the owner ID."),
+                builder.Configuration["source-db"] ?? throw new InvalidOperationException("Specify --source-db."),
+                int.TryParse(builder.Configuration["puzzle-limit"], out int limit) && limit > 0 ? limit : null);
+        else if (task == "grant")
+            await store.GrantApplicationAsync(builder.Configuration["application-name"]!, Guid.Parse(builder.Configuration["client-id"]!));
+        else if (task != "initialize") throw new ArgumentException("Unknown setup task.");
+        Console.WriteLine($"Cloud database ready: {await store.PuzzleCountAsync():N0} puzzles.");
+    }
+    catch (Exception error)
+    {
+        OperationDiagnostics.LogFailure(app.Logger, TrainerOperation.Startup, error);
+        Environment.ExitCode = 1;
+    }
+    return;
+}
+app.UsePrivacySafeDiagnostics();
 app.UseExceptionHandler(error => error.Run(async context =>
 {
     var exception = context.Features.Get<IExceptionHandlerFeature>()!.Error;
@@ -82,7 +100,6 @@ app.UseExceptionHandler(error => error.Run(async context =>
         ArgumentException or InvalidOperationException or InvalidDataException => 400,
         _ => 500
     };
-    app.Logger.Log(status == 500 ? LogLevel.Error : LogLevel.Warning, exception, "Request failed with status {Status}.", status);
     await Results.Problem(statusCode: status, detail: status == 500 ? "The operation failed. Try again; server diagnostics have been recorded." : exception.Message)
         .ExecuteAsync(context);
 }));
@@ -134,6 +151,11 @@ app.MapGet("/health/ready", async (CloudStore store, HttpContext context) =>
 app.MapTrainerApi();
 app.MapStaticAssets();
 app.MapRazorComponents<App>().AddInteractiveServerRenderMode();
-app.Run();
+try { app.Run(); }
+catch (Exception error)
+{
+    OperationDiagnostics.LogFailure(app.Logger, TrainerOperation.Startup, error);
+    Environment.ExitCode = 1;
+}
 
 public partial class Program;

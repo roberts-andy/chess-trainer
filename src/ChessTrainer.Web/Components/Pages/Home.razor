@@ -283,7 +283,7 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
                 history = await Store.HistoryAsync(owner);
                 moreHistory = history.Count == 200;
                 if (await Store.NewestDraftAsync(owner) is { } draft) SetCurrent(await Training.ReadAsync(user, draft.Id));
-            });
+            }, TrainerOperation.Startup);
         }
         loading = false;
     }
@@ -300,14 +300,14 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
             await JS.InvokeVoidAsync("chess.showScreenshot");
     }
 
-    private async Task Run(Func<Task> action)
+    private async Task Run(Func<Task> action, TrainerOperation operation = TrainerOperation.Request)
     {
         if (busy) return;
         busy = true; error = null; message = null;
         try { await action(); }
         catch (Exception ex)
         {
-            Logger.LogWarning(ex, "Trainer operation failed.");
+            OperationDiagnostics.LogFailure(Logger, operation, ex);
             error = ex is ArgumentException or InvalidOperationException or InvalidDataException or KeyNotFoundException or UnauthorizedAccessException or JSException
                 ? ex.Message : "The operation could not be completed. Reload to check the saved state before trying again.";
         }
@@ -324,7 +324,7 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
             if (tab == "Studies") studies = await Store.StudiesWithVersionsAsync(owner!);
             if (tab != "Studies" && page == "Studies") await JS.InvokeVoidAsync("chess.clearScreenshot");
             page = tab;
-        });
+        }, tab == "Studies" ? TrainerOperation.Study : TrainerOperation.Request);
     }
 
     private void SetCurrent(SessionView view)
@@ -338,7 +338,7 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
         if (!string.IsNullOrWhiteSpace(notation)) throw new InvalidOperationException("Add or clear pending notation first.");
         SetCurrent(await Training.StartAsync(user, new(minimum, maximum, current?.IsCustom == false ? current.PuzzleId : null, Mode: current?.Mode ?? SolveMode.Board)));
         flipped = !new ChessPosition(current!.StartingFen).WhiteToMove;
-    });
+    }, TrainerOperation.Attempt);
     private string MoveLabel(int ply)
     {
         var start = new ChessPosition(current!.StartingFen);
@@ -352,21 +352,21 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
         SetCurrent(await Training.ApplyAsync(user, current.Id, new(action, current.Revision, line ?? current.LineIndex,
             cursor ?? current.Cursor, value, mark)));
     }
-    private Task Command(string action) => Run(() => Apply(action));
-    private Task Navigate(int cursor) => Run(() => Apply("navigate", cursor: Math.Clamp(cursor, 0, ActiveLine.Moves.Count)));
-    private Task ModeChanged(ChangeEventArgs args) => Run(() => Apply("mode", args.Value!.ToString()!));
+    private Task Command(string action) => Run(() => Apply(action), TrainerOperation.Attempt);
+    private Task Navigate(int cursor) => Run(() => Apply("navigate", cursor: Math.Clamp(cursor, 0, ActiveLine.Moves.Count)), TrainerOperation.Attempt);
+    private Task ModeChanged(ChangeEventArgs args) => Run(() => Apply("mode", args.Value!.ToString()!), TrainerOperation.Attempt);
     private Task LineChanged(ChangeEventArgs args) => Run(() =>
     {
         int index = int.Parse(args.Value!.ToString()!);
         return Apply("navigate", cursor: current!.Lines[index].Moves.Count, line: index);
-    });
-    private Task AddNotation() => Run(async () => { await Apply("notation", notation); notation = ""; });
+    }, TrainerOperation.Attempt);
+    private Task AddNotation() => Run(async () => { await Apply("notation", notation); notation = ""; }, TrainerOperation.Attempt);
     private Task Submit() => Run(async () =>
     {
         if (!string.IsNullOrWhiteSpace(notation)) throw new InvalidOperationException("Add or clear pending notation before submitting.");
         await Apply("submit");
-    });
-    private Task SaveAnnotation() => Run(() => Apply("annotation", comment, mark: symbol));
+    }, TrainerOperation.Attempt);
+    private Task SaveAnnotation() => Run(() => Apply("annotation", comment, mark: symbol), TrainerOperation.Attempt);
     private async Task SquareClicked(string square)
     {
         if (busy || current is null || current.Submitted || current.Mode != SolveMode.Board) return;
@@ -383,9 +383,9 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
             char moving = board.PieceAt(selectedSquare);
             if (char.ToUpperInvariant(moving) == 'P' && square[1] is '1' or '8') { promotionMove = move; return; }
             await Apply("uci", move);
-        });
+        }, TrainerOperation.Attempt);
     }
-    private Task Promote(string piece) => Run(() => Apply("uci", promotionMove + piece));
+    private Task Promote(string piece) => Run(() => Apply("uci", promotionMove + piece), TrainerOperation.Attempt);
     private async Task ReadHistory()
     {
         history = await Store.HistoryAsync(owner!);
@@ -397,23 +397,23 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
         var older = await Store.HistoryAsync(owner!, history.Count);
         history = history.Concat(older).DistinctBy(h => h.Id).ToArray();
         moreHistory = older.Count == 200;
-    });
+    }, TrainerOperation.Attempt);
     private Task OpenAttempt(Guid id) => Run(async () =>
     {
         if (!string.IsNullOrWhiteSpace(notation)) throw new InvalidOperationException("Add or clear pending notation in Practice first.");
         SetCurrent(await Training.ReadAsync(user, id)); page = "Practice";
-    });
+    }, TrainerOperation.Attempt);
     private Task CreateStudy() => Run(async () =>
     {
         var study = new Study(Guid.NewGuid(), studyName);
         studyVersion = await Store.SaveStudyAsync(owner!, study, true); studies = await Store.StudiesWithVersionsAsync(owner!);
         selectedStudy = study.Id; studyName = ""; positions = []; NewPosition();
-    });
+    }, TrainerOperation.Study);
     private Task RenameStudy() => Run(async () =>
     {
         studyVersion = await Store.SaveStudyAsync(owner!, new(RequireStudy(), studyName), false, studyVersion);
         studies = await Store.StudiesWithVersionsAsync(owner!); studyName = "";
-    });
+    }, TrainerOperation.Study);
     private Guid RequireStudy() => selectedStudy ?? throw new InvalidOperationException("Create or select a study first.");
     private Task StudyChanged(ChangeEventArgs args) => Run(async () =>
     {
@@ -421,7 +421,7 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
         studyVersion = selectedStudy is Guid selected ? studies.First(s => s.Id == selected).Version : 0;
         positions = selectedStudy is Guid study ? await Store.PositionsWithVersionsAsync(owner!, study) : [];
         NewPosition();
-    });
+    }, TrainerOperation.Study);
     private void NewPosition()
     {
         editingPosition = null; positionTitle = positionFen = solution = positionNotes = "";
@@ -448,19 +448,19 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
         positions = await Store.PositionsWithVersionsAsync(owner!, position.StudyId);
         EditPosition(positions.Single(p => p.Id == position.Id));
         message = "Position saved to your study.";
-    });
+    }, TrainerOperation.Study);
     private Task PracticePosition() => Run(async () =>
     {
         if (!string.IsNullOrWhiteSpace(notation)) throw new InvalidOperationException("Add or clear pending notation in Practice first.");
         SetCurrent(await Training.StartAsync(user, new(PositionId: editingPosition, Mode: current?.Mode ?? SolveMode.Board)));
         flipped = !new ChessPosition(current!.StartingFen).WhiteToMove; page = "Practice";
-    });
+    }, TrainerOperation.Attempt);
     private Task MovePosition() => Run(async () =>
     {
         if (editingPosition is not Guid id || destination is not Guid target) throw new InvalidOperationException("Select a position and destination.");
         await Store.MovePositionAsync(owner!, id, target, positionVersion);
         positions = await Store.PositionsWithVersionsAsync(owner!, RequireStudy()); NewPosition();
-    });
+    }, TrainerOperation.Study);
     private Task ImportCsv(InputFileChangeEventArgs args) => Run(async () =>
     {
         Guid study = RequireStudy();
@@ -470,8 +470,8 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
         var imported = StudyPosition.ReadCsv(memory, study);
         await Store.SavePositionsAsync(owner!, study, imported, true);
         positions = await Store.PositionsWithVersionsAsync(owner!, study); message = $"Imported {imported.Count} positions.";
-    });
-    private Task PreviewPosition() => Run(() => { previewFen = StudyPosition.ValidateFen(positionFen); return Task.CompletedTask; });
+    }, TrainerOperation.Study);
+    private Task PreviewPosition() => Run(() => { previewFen = StudyPosition.ValidateFen(positionFen); return Task.CompletedTask; }, TrainerOperation.Study);
     private void SetImportSource(string source)
     {
         importSource = source;
@@ -481,7 +481,7 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
     private async Task PasteScreenshot()
     {
         try { await JS.InvokeVoidAsync("chess.paste"); }
-        catch (JSException ex) { Logger.LogWarning(ex, "Clipboard access failed."); error = ex.Message; }
+        catch (JSException ex) { OperationDiagnostics.LogFailure(Logger, TrainerOperation.Vision, ex); error = "Clipboard access failed."; }
     }
     [JSInvokable] public Task ScreenshotSelectionChanged(string? generation, bool ready, string errorText)
     {
@@ -527,7 +527,7 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
             throw new InvalidOperationException("The selected screenshot changed while recognition was running. Its result was not applied.");
         positionFen = $"{result.Placement} w - - 0 1"; aiGenerated = true; fenReviewed = false;
         visionNote = "FEN generated. Review it before saving. " + result.Uncertainties;
-    });
+    }, TrainerOperation.Vision);
     private Task ThemeChanged(ChangeEventArgs args) => Run(async () =>
     {
         theme = args.Value!.ToString()!; await Store.SaveSettingAsync(owner!, "theme", theme);

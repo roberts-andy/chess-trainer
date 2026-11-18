@@ -2,6 +2,7 @@
 **/obj/
 .vs/
 artifacts/
+.copilot-tracking/
 *.user
 *.db
 *.db-shm
