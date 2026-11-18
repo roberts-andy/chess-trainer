@@ -271,17 +271,10 @@ public sealed partial class MainWindow
     private void PracticeStudyPosition()
     {
         if (studyPositions.SelectedItem is not StudyPosition position) throw new InvalidOperationException("Select a study position.");
-        if (!string.IsNullOrWhiteSpace(notation.Text)) throw new InvalidOperationException("Add or clear pending notation in Practice before changing positions.");
-        SaveCurrent();
+        EnsureCanChangeAttempt();
         var next = new TrainingSession(position.ToPuzzle(), (SolveMode)Math.Max(0, mode.SelectedIndex));
         if (!string.IsNullOrWhiteSpace(position.Notes)) next.Annotate(position.Notes, "");
-        store.SaveAttempt(next.Snapshot());
-        session = next;
-        flipped = !new ChessPosition(next.StartingFen).WhiteToMove;
-        selectedSquare = null;
-        notification.IsOpen = false;
-        ShowPage(practice);
-        RenderSession();
+        StartAttempt(next);
     }
 
     private async Task ImportStudyCsvAsync()

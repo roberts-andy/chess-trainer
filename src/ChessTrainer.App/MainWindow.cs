@@ -1,4 +1,5 @@
 using ChessTrainer.Core;
+using Microsoft.Data.Sqlite;
 using Microsoft.UI;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Automation;
@@ -49,8 +50,13 @@ public sealed partial class MainWindow : Window
     private StackPanel? historyPanel;
     private StackPanel? libraryPanel;
     private TrainingSession? session;
+    private long attemptRevision;
     private CancellationTokenSource? importCancellation;
     private string? selectedSquare;
+    private Button? dragSource;
+    private string? pendingBoardMove;
+    private readonly TextBlock pendingBoardMoveLabel = Text("", 12);
+    private readonly StackPanel pendingBoardMovePanel = new() { Spacing = 6, Visibility = Visibility.Collapsed };
     private bool flipped;
     private bool refreshing;
     private bool initialized;
@@ -90,35 +96,43 @@ public sealed partial class MainWindow : Window
         var draft = recent.FirstOrDefault(a => a.SubmittedAt is null);
         if (draft is not null)
         {
-            session = new TrainingSession(await Task.Run(() => store.ReadAttempt(draft.Id)));
-            flipped = !new ChessPosition(session.StartingFen).WhiteToMove;
-            Notify("Restored your most recent unsubmitted attempt. No solution has been revealed.", InfoBarSeverity.Informational);
-            RenderSession();
+            var saved = await Task.Run(() => store.ReadAttemptForEdit(draft.Id));
+            if (session is not null) return;
+            OpenAttempt(new TrainingSession(saved.Attempt), saved.Revision);
+            if (!saved.Attempt.SubmittedAt.HasValue)
+                Notify("Restored your most recent unsubmitted attempt. No solution has been revealed.", InfoBarSeverity.Informational);
         }
-        else await StartPuzzleAsync();
+        else if (session is null) await StartPuzzleAsync();
     }
 
     private async Task StartPuzzleAsync()
     {
         if (!initialized) return;
-        if (!string.IsNullOrWhiteSpace(notation.Text))
-        {
-            Notify("Add or clear the pending notation before changing puzzles.", InfoBarSeverity.Warning);
-            return;
-        }
+        EnsureCanChangeAttempt();
         int min = ReadRating(minimum.Value);
         int max = ReadRating(maximum.Value);
-        SaveCurrent();
-        var puzzle = await Task.Run(() => store.RandomPuzzle(min, max, session?.Puzzle.Id));
+        var previous = session;
+        var previousPage = page.Content;
+        var puzzle = await Task.Run(() => store.RandomPuzzle(min, max, previous?.Puzzle.Id));
+        if (!ReferenceEquals(previous, session) || !ReferenceEquals(previousPage, page.Content))
+            throw new InvalidOperationException("The active attempt changed while loading a puzzle. Try again.");
+        EnsureCanChangeAttempt();
         if (puzzle is null)
         {
             Notify("No imported puzzles match that range. Widen it or import more puzzles in Puzzle library.", InfoBarSeverity.Warning);
             return;
         }
-        var next = new TrainingSession(puzzle, (SolveMode)Math.Max(0, mode.SelectedIndex));
-        store.SaveAttempt(next.Snapshot());
+        StartAttempt(new TrainingSession(puzzle, (SolveMode)Math.Max(0, mode.SelectedIndex)));
+    }
+
+    private void StartAttempt(TrainingSession next) =>
+        OpenAttempt(next, PersistAttempt(next.Snapshot(), expectedRevision: null));
+
+    private void OpenAttempt(TrainingSession next, long revision)
+    {
         session = next;
-        flipped = !new ChessPosition(session.StartingFen).WhiteToMove;
+        attemptRevision = revision;
+        flipped = !new ChessPosition(next.StartingFen).WhiteToMove;
         selectedSquare = null;
         notification.IsOpen = false;
         ShowPage(practice);
@@ -251,28 +265,42 @@ public sealed partial class MainWindow : Window
                 AllowDrop = true
             };
             AutomationProperties.SetName(button, $"{square}: {PieceName(piece)}");
-            button.Click += async (_, _) => await GuardAsync(() => ClickSquareAsync(square));
+            bool IsCurrentSquare() => squares.TryGetValue(square, out var current) &&
+                ReferenceEquals(current, button) && ReferenceEquals(page.Content, practice);
+            button.Click += async (_, _) =>
+            {
+                if (IsCurrentSquare()) await GuardAsync(() => ClickSquareAsync(square));
+            };
             button.DragStarting += (_, args) =>
             {
-                if (session is not { Mode: SolveMode.Board, Submitted: false } ||
+                if (!IsCurrentSquare() || pendingBoardMove is not null ||
+                    session is not { Mode: SolveMode.Board, Submitted: false } ||
                     piece == ' ' || char.IsUpper(piece) != session.CurrentPosition.WhiteToMove)
                 {
                     args.Cancel = true;
                     return;
                 }
+                dragSource = button;
                 args.Data.SetText(square);
                 args.Data.RequestedOperation = DataPackageOperation.Move;
             };
+            button.DropCompleted += (_, _) =>
+            {
+                if (ReferenceEquals(dragSource, button)) dragSource = null;
+            };
             button.DragOver += (_, args) =>
             {
-                if (session is { Mode: SolveMode.Board, Submitted: false } && args.DataView.Contains(StandardDataFormats.Text))
+                if (IsCurrentSquare() && pendingBoardMove is null &&
+                    session is { Mode: SolveMode.Board, Submitted: false } && args.DataView.Contains(StandardDataFormats.Text))
                     args.AcceptedOperation = DataPackageOperation.Move;
             };
             button.Drop += async (_, args) => await GuardAsync(async () =>
             {
-                if (!args.DataView.Contains(StandardDataFormats.Text)) return;
+                var source = dragSource;
+                if (source is null || !IsCurrentSquare() || !args.DataView.Contains(StandardDataFormats.Text)) return;
                 string from = await args.DataView.GetTextAsync();
-                if (squares.ContainsKey(from) && from != square) await MovePieceAsync(from, square);
+                if (IsCurrentSquare() && from != square && squares.TryGetValue(from, out var currentSource) &&
+                    ReferenceEquals(source, currentSource)) await MovePieceAsync(from, square);
             });
             Grid.SetRow(button, row);
             Grid.SetColumn(button, col);
@@ -284,6 +312,7 @@ public sealed partial class MainWindow : Window
     private async Task ClickSquareAsync(string square)
     {
         if (session is not { Mode: SolveMode.Board, Submitted: false }) return;
+        EnsureNoPendingPositionEdit();
         char piece = session.CurrentPosition.PieceAt(square);
         if (piece != ' ' && char.IsUpper(piece) == session.CurrentPosition.WhiteToMove)
         {
@@ -297,9 +326,12 @@ public sealed partial class MainWindow : Window
 
     private async Task MovePieceAsync(string from, string to)
     {
-        if (session is not { Mode: SolveMode.Board, Submitted: false }) return;
+        if (session is not { Mode: SolveMode.Board, Submitted: false } current) return;
+        EnsureNoPendingPositionEdit();
         string move = from + to;
-        string[] candidates = session.CurrentPosition.LegalMoves().Where(m => m.StartsWith(move, StringComparison.Ordinal)).ToArray();
+        int line = current.ActiveLineIndex;
+        int cursor = current.Cursor;
+        string[] candidates = current.CurrentPosition.LegalMoves().Where(m => m.StartsWith(move, StringComparison.Ordinal)).ToArray();
         if (candidates.Any(m => m.Length == 5))
         {
             var choice = new ComboBox { HorizontalAlignment = HorizontalAlignment.Stretch };
@@ -307,65 +339,120 @@ public sealed partial class MainWindow : Window
             choice.SelectedIndex = 0;
             var dialog = Dialog("Promote pawn", choice, "Promote", "Cancel");
             if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+            if (!ReferenceEquals(session, current) || !ReferenceEquals(page.Content, practice) ||
+                line != current.ActiveLineIndex || cursor != current.Cursor)
+                throw new InvalidOperationException("The active position changed. Choose the board move again.");
+            EnsureNoPendingPositionEdit();
             move += "qrbn"[choice.SelectedIndex];
         }
-        Edit(s => s.AppendUci(move));
+        CommitBoardMove(move);
     }
 
-    private void AddNotation()
+    private void CommitBoardMove(string move)
     {
-        Guard(() =>
+        CommitEdit(s => s.AppendUci(move), () =>
         {
-            if (session is null) return;
-            session.AppendNotation(notation.Text);
-            notation.Text = "";
-            selectedSquare = null;
-            SaveCurrent();
-            RenderSession();
+            // Only a valid move that reached persistence can become a pending retry.
+            pendingBoardMove = move;
+            RenderPendingBoardMove();
         });
+        pendingBoardMove = null;
+        RenderPendingBoardMove();
+        RenderSession();
     }
+
+    private void RenderPendingBoardMove()
+    {
+        pendingBoardMoveLabel.Text = pendingBoardMove is null ? "" : $"Unsaved board move: {pendingBoardMove}";
+        pendingBoardMovePanel.Visibility = pendingBoardMove is null ? Visibility.Collapsed : Visibility.Visible;
+        moveComment.IsEnabled = moveSymbol.IsEnabled = session is not null && pendingBoardMove is null;
+    }
+
+    private void AddNotation() => Guard(() =>
+    {
+        if (session is null) return;
+        EnsureNoPendingPositionEdit();
+        CommitEdit(s => s.AppendNotation(notation.Text));
+        notation.Text = "";
+        RenderSession();
+    });
 
     private void Edit(Action<TrainingSession> action) => Guard(() =>
     {
         if (session is null) return;
-        action(session);
-        selectedSquare = null;
-        SaveCurrent();
+        EnsureNoPendingPositionEdit();
+        CommitEdit(action);
         RenderSession();
     });
 
+    private void CommitEdit(Action<TrainingSession> edit, Action? beforeSave = null, bool clearBoardSelection = true)
+    {
+        var current = session ?? throw new InvalidOperationException("No attempt is open.");
+        session = AttemptEdit.Commit(current, edit, candidate =>
+        {
+            beforeSave?.Invoke();
+            attemptRevision = PersistAttempt(candidate, attemptRevision);
+        });
+        if (clearBoardSelection) selectedSquare = null;
+        notification.IsOpen = false;
+    }
+
+    private long PersistAttempt(Attempt candidate, long? expectedRevision)
+    {
+        try { return store.SaveAttempt(candidate, expectedRevision); }
+        catch (SqliteException ex)
+        {
+            throw new IOException($"Could not save the attempt. No changes were applied. {ex.Message}", ex);
+        }
+    }
+
+    private void EnsureNoPendingPositionEdit()
+    {
+        if (pendingBoardMove is not null)
+            throw new InvalidOperationException("Retry or discard the unsaved board move first.");
+        if (HasPendingAnnotation)
+            throw new InvalidOperationException("Save or discard the pending annotation before leaving this position.");
+    }
+
+    private void EnsureCanChangeAttempt()
+    {
+        EnsureNoPendingPositionEdit();
+        if (!string.IsNullOrWhiteSpace(notation.Text))
+            throw new InvalidOperationException("Add or clear pending notation in Practice before changing attempts.");
+    }
+
     private void Navigate(int ply) => Guard(() =>
     {
-        session?.Navigate(ply);
+        if (session is null || session.Cursor == Math.Clamp(ply, 0, session.ActiveLine.Moves.Count)) return;
+        if (pendingBoardMove is not null || HasPendingAnnotation)
+        {
+            refreshing = true;
+            try { moves.SelectedIndex = session.Cursor; }
+            finally { refreshing = false; }
+            EnsureNoPendingPositionEdit();
+        }
+        session.Navigate(ply);
         selectedSquare = null;
         RenderSession();
     });
 
     private async Task SubmitAsync()
     {
-        if (session is null || session.Submitted) return;
+        if (session is not { Submitted: false } current) return;
+        EnsureNoPendingPositionEdit();
         if (!string.IsNullOrWhiteSpace(notation.Text))
             throw new InvalidOperationException("Add or clear the pending notation before submitting.");
         var dialog = Dialog("Submit all lines?",
             Text("This locks your moves and saves all lines. A reference solution, if supplied, is revealed. Lines without a reference are Unverified. Comments remain editable during review.", 15),
             "Submit", "Keep thinking");
         if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
-        session.Submit();
-        try { SaveCurrent(); }
-        catch
-        {
-            // Keep the solution hidden if persistence fails; the user can retry submission.
-            var snapshot = session.Snapshot() with { SubmittedAt = null, Results = null };
-            session = new TrainingSession(snapshot);
-            throw;
-        }
-        notification.IsOpen = false;
+        if (!ReferenceEquals(current, session) || !ReferenceEquals(page.Content, practice))
+            throw new InvalidOperationException("The active attempt changed. Confirm submission again.");
+        EnsureNoPendingPositionEdit();
+        if (!string.IsNullOrWhiteSpace(notation.Text))
+            throw new InvalidOperationException("Add or clear the pending notation before submitting.");
+        CommitEdit(s => s.Submit());
         RenderSession();
-    }
-
-    private void SaveCurrent()
-    {
-        if (session is not null) store.SaveAttempt(session.Snapshot());
     }
 
     private void ShowHistory()
@@ -374,7 +461,6 @@ public sealed partial class MainWindow : Window
         {
             if (!initialized) return;
             if (ImportInProgress()) return;
-            SaveCurrent();
             var items = store.History();
             history.ItemsSource = items;
             int submitted = items.Count(a => a.SubmittedAt.HasValue);
@@ -393,15 +479,9 @@ public sealed partial class MainWindow : Window
             panel.Children.Add(Action("Open / resume selected attempt", () => Guard(() =>
             {
                 if (history.SelectedItem is not HistoryItem item) return;
-                if (!string.IsNullOrWhiteSpace(notation.Text))
-                    throw new InvalidOperationException("Add or clear pending notation in Practice before changing attempts.");
-                SaveCurrent();
-                session = new TrainingSession(store.ReadAttempt(item.Id));
-                flipped = !new ChessPosition(session.StartingFen).WhiteToMove;
-                selectedSquare = null;
-                notification.IsOpen = false;
-                ShowPage(practice);
-                RenderSession();
+                EnsureCanChangeAttempt();
+                var saved = store.ReadAttemptForEdit(item.Id);
+                OpenAttempt(new TrainingSession(saved.Attempt), saved.Revision);
             })));
             historyPanel = panel;
             ShowPage(historyPanel);
@@ -551,9 +631,16 @@ public sealed partial class MainWindow : Window
 
     private void ShowError(Exception ex)
     {
-        Directory.CreateDirectory(dataDirectory);
-        File.AppendAllText(Path.Combine(dataDirectory, "errors.log"), $"{DateTimeOffset.Now:O}\n{ex}\n");
         Notify(ex.Message, InfoBarSeverity.Error);
+        try
+        {
+            Directory.CreateDirectory(dataDirectory);
+            File.AppendAllText(Path.Combine(dataDirectory, "errors.log"), $"{DateTimeOffset.Now:O}\n{ex}\n");
+        }
+        catch (Exception logError) when (logError is IOException or UnauthorizedAccessException)
+        {
+            Notify($"{ex.Message} The local error log could not be written.", InfoBarSeverity.Error);
+        }
     }
 
     private void Notify(string message, InfoBarSeverity severity)

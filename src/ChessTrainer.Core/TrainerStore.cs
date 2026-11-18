@@ -8,6 +8,13 @@ using ZstdSharp;
 namespace ChessTrainer.Core;
 
 public sealed record ImportProgress(long Rows, string Message);
+public sealed record SavedLocalAttempt(Attempt Attempt, long Revision);
+
+public sealed class AttemptConflictException() : InvalidOperationException(
+    "This attempt changed in another window. No changes were saved. Open it again from Results to load the latest version.")
+{
+}
+
 public sealed record HistoryItem(Guid Id, string PuzzleId, int Rating, DateTimeOffset StartedAt,
     DateTimeOffset? SubmittedAt, SolveMode Mode, string Outcome, string Title = "", bool IsCustom = false)
 {
@@ -49,7 +56,8 @@ public sealed partial class TrainerStore
                 Rating INTEGER NOT NULL, Themes TEXT NOT NULL, GameUrl TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS IX_Puzzles_Rating ON Puzzles(Rating, Id);
             CREATE TABLE IF NOT EXISTS Attempts (
-                Id TEXT PRIMARY KEY, StartedAt TEXT NOT NULL, Payload TEXT NOT NULL);
+                Id TEXT PRIMARY KEY, StartedAt TEXT NOT NULL, Payload TEXT NOT NULL,
+                Revision INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS Settings (
                 Name TEXT PRIMARY KEY, Value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS Studies (
@@ -60,6 +68,17 @@ public sealed partial class TrainerStore
             CREATE INDEX IF NOT EXISTS IX_StudyPositions_Study ON StudyPositions(StudyId);
             """;
         command.ExecuteNonQuery();
+
+        // Check and upgrade under the same write lock when two instances initialize together.
+        using var transaction = connection.BeginTransaction(deferred: false);
+        command.Transaction = transaction;
+        command.CommandText = "SELECT COUNT(*) FROM pragma_table_info('Attempts') WHERE name = 'Revision'";
+        if ((long)command.ExecuteScalar()! == 0)
+        {
+            command.CommandText = "ALTER TABLE Attempts ADD COLUMN Revision INTEGER NOT NULL DEFAULT 0";
+            command.ExecuteNonQuery();
+        }
+        transaction.Commit();
     }
 
     public string? GetSetting(string name)
@@ -116,18 +135,64 @@ public sealed partial class TrainerStore
             reader.GetInt32(3), reader.GetString(4), reader.GetString(5)) : null;
     }
 
-    public void SaveAttempt(Attempt attempt)
+    // Saving a new ID needs no revision. Updating an existing ID always requires one.
+    public void SaveAttempt(Attempt attempt) => SaveAttempt(attempt, expectedRevision: null);
+
+    public long SaveAttempt(Attempt attempt, long? expectedRevision)
     {
         using var connection = Open();
         using var command = connection.CreateCommand();
-        command.CommandText = """
-            INSERT INTO Attempts(Id,StartedAt,Payload) VALUES($id,$date,$json)
-            ON CONFLICT(Id) DO UPDATE SET Payload=excluded.Payload
-            """;
+        command.CommandTimeout = 5;
         command.Parameters.AddWithValue("$id", attempt.Id.ToString());
-        command.Parameters.AddWithValue("$date", attempt.StartedAt.ToString("O"));
+        if (expectedRevision is null)
+        {
+            command.CommandText = """
+                INSERT INTO Attempts(Id,StartedAt,Payload) VALUES($id,$date,$json)
+                ON CONFLICT(Id) DO NOTHING
+                """;
+            command.Parameters.AddWithValue("$date", attempt.StartedAt.ToString("O"));
+        }
+        else
+        {
+            command.Parameters.AddWithValue("$expected", expectedRevision.Value);
+            command.CommandText = "SELECT Payload FROM Attempts WHERE Id=$id AND Revision=$expected";
+            if (command.ExecuteScalar() is not string payload)
+                throw new AttemptConflictException();
+            var original = JsonSerializer.Deserialize<Attempt>(payload)!;
+            if (original.SubmittedAt.HasValue && !IsAnnotationOnlyEdit(original, attempt))
+                throw new InvalidOperationException("Only annotations can be changed on a submitted attempt.");
+
+            // The final comparison and write are one statement; another writer can win after the read.
+            command.CommandText = """
+                UPDATE Attempts SET Payload=$json, Revision=Revision+1
+                WHERE Id=$id AND Revision=$expected
+                """;
+        }
         command.Parameters.AddWithValue("$json", JsonSerializer.Serialize(attempt));
-        command.ExecuteNonQuery();
+        if (command.ExecuteNonQuery() != 1)
+            throw new AttemptConflictException();
+        return expectedRevision is long revision ? revision + 1 : 0;
+    }
+
+    private static bool IsAnnotationOnlyEdit(Attempt original, Attempt edited) =>
+        original.Puzzle == edited.Puzzle && original.StartedAt == edited.StartedAt &&
+        original.SubmittedAt == edited.SubmittedAt && original.Mode == edited.Mode &&
+        (original.Results is null ? edited.Results is null :
+            edited.Results is not null && original.Results.SequenceEqual(edited.Results)) &&
+        original.Lines.Count == edited.Lines.Count &&
+        original.Lines.Zip(edited.Lines).All(pair =>
+            pair.First.Name == pair.Second.Name && pair.First.BranchPly == pair.Second.BranchPly &&
+            pair.First.Moves.SequenceEqual(pair.Second.Moves) && pair.First.San.SequenceEqual(pair.Second.San));
+
+    public SavedLocalAttempt ReadAttemptForEdit(Guid id)
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT Payload, Revision FROM Attempts WHERE Id=$id";
+        command.Parameters.AddWithValue("$id", id.ToString());
+        using var reader = command.ExecuteReader();
+        if (!reader.Read()) throw new InvalidOperationException("Attempt not found.");
+        return new(JsonSerializer.Deserialize<Attempt>(reader.GetString(0))!, reader.GetInt64(1));
     }
 
     public Attempt ReadAttempt(Guid id)

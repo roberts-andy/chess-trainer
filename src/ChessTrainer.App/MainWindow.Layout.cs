@@ -196,9 +196,14 @@ public sealed partial class MainWindow
         mode.SelectedIndex = 0;
         mode.SelectionChanged += (_, _) => Guard(() =>
         {
-            if (refreshing || session is null || session.Submitted) return;
-            session.Mode = (Core.SolveMode)mode.SelectedIndex;
-            SaveCurrent();
+            if (refreshing || session is not { Submitted: false } current ||
+                mode.SelectedIndex < 0 || mode.SelectedIndex == (int)current.Mode) return;
+            var nextMode = (Core.SolveMode)mode.SelectedIndex;
+            refreshing = true;
+            try { mode.SelectedIndex = (int)current.Mode; }
+            finally { refreshing = false; }
+            EnsureNoPendingPositionEdit();
+            CommitEdit(s => s.Mode = nextMode);
             RenderSession();
         });
         analysis.Children.Add(mode);
@@ -206,8 +211,18 @@ public sealed partial class MainWindow
         analysis.Children.Add(modeHint);
         lines.SelectionChanged += (_, _) => Guard(() =>
         {
-            if (refreshing || session is null || lines.SelectedIndex < 0) return;
-            session.SelectLine(lines.SelectedIndex);
+            if (refreshing || session is null || lines.SelectedIndex < 0 ||
+                lines.SelectedIndex == session.ActiveLineIndex) return;
+            int nextLine = lines.SelectedIndex;
+            if (pendingBoardMove is not null || HasPendingAnnotation)
+            {
+                refreshing = true;
+                try { lines.SelectedIndex = session.ActiveLineIndex; }
+                finally { refreshing = false; }
+                EnsureNoPendingPositionEdit();
+            }
+            session.SelectLine(nextLine);
+            selectedSquare = null;
             RenderSession();
         });
         analysis.Children.Add(lines);
@@ -226,6 +241,20 @@ public sealed partial class MainWindow
         editActions.Children.Add(removeVariation);
         var more = new Button { Content = "Line actions", Flyout = new Flyout { Content = editActions } };
         analysis.Children.Add(Row(branch, more));
+        pendingBoardMovePanel.Children.Add(pendingBoardMoveLabel);
+        pendingBoardMovePanel.Children.Add(Row(
+            Action("Retry board move", () => Guard(() =>
+            {
+                if (pendingBoardMove is { } move) CommitBoardMove(move);
+            })),
+            Action("Discard board move", () =>
+            {
+                pendingBoardMove = null;
+                selectedSquare = null;
+                RenderPendingBoardMove();
+                RenderBoard();
+            })));
+        analysis.Children.Add(pendingBoardMovePanel);
         analysis.Children.Add(notation);
         notation.KeyDown += (_, args) =>
         {

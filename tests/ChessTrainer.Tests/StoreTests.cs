@@ -69,14 +69,15 @@ public sealed class StoreTests : IDisposable
         var draft = session.Snapshot();
         store.SaveAttempt(draft);
         var reopened = new TrainerStore(Path.Combine(directory, "test.db"));
-        var restored = new TrainingSession(reopened.ReadAttempt(draft.Id));
+        var savedDraft = reopened.ReadAttemptForEdit(draft.Id);
+        var restored = new TrainingSession(savedDraft.Attempt);
         Assert.Null(restored.Results);
         Assert.Equal(restored.StartingFen, restored.DisplayFen);
         Assert.Equal(2, restored.Lines.Count);
         Assert.Equal(SolveMode.Visualization, restored.Mode);
         Assert.Equal("Unsubmitted", Assert.Single(reopened.History()).Outcome);
         restored.SelectLine(0);
-        reopened.SaveAttempt(restored.Submit());
+        reopened.SaveAttempt(restored.Submit(), savedDraft.Revision);
         var final = reopened.ReadAttempt(draft.Id);
         Assert.NotNull(final.SubmittedAt);
         Assert.Equal(Verdict.Correct, final.Results![0].Verdict);
