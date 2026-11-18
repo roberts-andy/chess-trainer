@@ -214,6 +214,7 @@ $server = $state.SqlServer
 $database = $state.Database
 $registry = $state.Registry
 $environment = $state.Environment
+Assert-SqlPrivateAccess (AzJson @('sql', 'server', 'show', '--name', $server, '--resource-group', $ResourceGroup))
 if ($RollbackManifest) { Restore-WebRelease $RollbackManifest; return }
 if ($ProvisionOnly) { Write-Output "Provisioned $($state.Url). Ready for private-network database initialization and app deployment."; return }
 Assert-WebReleaseMode (Get-WebApp)

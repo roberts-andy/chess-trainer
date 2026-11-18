@@ -42,6 +42,9 @@ try {
     Assert-ReleaseFailure { & $deploy -RollbackManifest $missing } '*ConfirmSchemaCompatibility*'
 
     . $releaseScript
+    Assert-SqlPrivateAccess @{ publicNetworkAccess = 'Disabled' }
+    Assert-ReleaseFailure { Assert-SqlPrivateAccess @{ publicNetworkAccess = 'Enabled' } } '*must be Disabled*'
+    Assert-ReleaseFailure { Assert-SqlPrivateAccess @{} } '*must be Disabled*'
     $web = 'trainer-test'
     $ResourceGroup = 'release-tests'
     $output = $scratch

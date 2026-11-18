@@ -11,6 +11,12 @@ function Get-WebApp {
     AzJson @('containerapp', 'show', '--name', $web, '--resource-group', $ResourceGroup)
 }
 
+function Assert-SqlPrivateAccess($Server) {
+    if ($Server.publicNetworkAccess -ne 'Disabled') {
+        throw 'SQL public network access must be Disabled before deployment. Restore private-only access and verify the private endpoint.'
+    }
+}
+
 function Get-WebRevision([string]$Revision) {
     AzJson @('containerapp', 'revision', 'show', '--name', $web, '--resource-group', $ResourceGroup, '--revision', $Revision)
 }
