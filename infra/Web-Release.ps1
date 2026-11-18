@@ -8,7 +8,8 @@ function Get-WebProbes {
 }
 
 function Get-WebApp {
-    AzJson @('containerapp', 'show', '--name', $web, '--resource-group', $ResourceGroup)
+    $appId = "/subscriptions/$($state.SubscriptionId)/resourceGroups/$ResourceGroup/providers/Microsoft.App/containerApps/$web"
+    AzJson @('rest', '--method', 'get', '--uri', "${appId}?api-version=2025-07-01")
 }
 
 function Assert-SqlPrivateAccess($Server) {
@@ -172,7 +173,7 @@ function Start-WebCandidate {
     $path = Join-Path $output "candidate-$Release.json"
     try {
         [IO.File]::WriteAllText($path, ($body | ConvertTo-Json -Depth 50))
-        AzJson @('rest', '--method', 'patch', '--uri', "$($app.id)?api-version=2024-03-01", '--body', "@$path") | Out-Null
+        AzJson @('rest', '--method', 'patch', '--uri', "$($app.id)?api-version=2025-07-01", '--body', "@$path") | Out-Null
     }
     finally { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
 }

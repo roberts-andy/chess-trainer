@@ -80,7 +80,7 @@ try {
                 latestRevisionName = $script:latest; latestReadyRevisionName = $script:latestReady
                 configuration = @{ activeRevisionsMode = 'Single'; ingress = @{ external = $true; targetPort = $script:targetPort; fqdn = 'trainer.invalid' } }
                 template = [pscustomobject]@{
-                    scale = @{ minReplicas = 0; maxReplicas = 1 }
+                    scale = @{ minReplicas = 0; maxReplicas = 1; cooldownPeriod = 300; pollingInterval = 30 }
                     containers = @([pscustomobject]@{ image = 'placeholder' })
                 }
             }
@@ -93,10 +93,12 @@ try {
             throw 'Unexpected Azure request in candidate fixture.'
         }
         $body = Get-Content -LiteralPath $Arguments[-1].Substring(1) -Raw | ConvertFrom-Json
+        Assert-ReleaseTest ($Arguments -contains "${appId}?api-version=2025-07-01") 'Candidate API must support the preserved scale fields.'
         $template = $body.properties.template
         $container = $template.containers[0]
         Assert-ReleaseTest (-not $body.properties.configuration) 'Candidate patch must not overwrite app-scoped configuration.'
         Assert-ReleaseTest ($template.revisionSuffix -ceq $release -and $container.image -ceq $image) 'Candidate patch has the wrong identity.'
+        Assert-ReleaseTest ($template.scale.cooldownPeriod -eq 300 -and $template.scale.pollingInterval -eq 30) 'Candidate must preserve the existing scale timing.'
         Assert-ReleaseTest ($container.env[0].name -eq 'Release__Id' -and $container.env[0].value -ceq $release) 'Candidate patch is missing its HTTP identity.'
         Assert-ReleaseTest ($container.probes.Count -eq 3) 'Expected explicit startup, liveness and readiness probes.'
         foreach ($probe in $container.probes) {
