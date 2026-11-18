@@ -1,4 +1,5 @@
 using System.Security.Claims;
+using System.Data.Common;
 using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
 using Azure.Core;
@@ -112,8 +113,23 @@ app.UseAuthentication();
 app.UseAuthorization();
 app.UseRateLimiter();
 app.UseAntiforgery();
-app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
-app.MapGet("/health/ready", async (CloudStore store) => { await store.CheckReadyAsync(); return Results.Ok(new { status = "ready" }); })
+string? release = builder.Configuration["Release:Id"];
+string? revision = Environment.GetEnvironmentVariable("CONTAINER_APP_REVISION");
+app.MapGet("/health", (HttpContext context) =>
+{
+    context.Response.Headers.CacheControl = "no-store";
+    return Results.Ok(new { status = "ok", release, revision });
+});
+app.MapGet("/health/ready", async (CloudStore store, HttpContext context) =>
+{
+    context.Response.Headers.CacheControl = "no-store";
+    try { await store.CheckReadyAsync(); }
+    catch (Exception error) when (error is DbException or TimeoutException or AuthenticationFailedException)
+    {
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+    }
+    return Results.Ok(new { status = "ready", release, revision });
+})
     .RequireRateLimiting("api");
 app.MapTrainerApi();
 app.MapStaticAssets();

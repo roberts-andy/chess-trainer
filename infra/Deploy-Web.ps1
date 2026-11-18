@@ -7,17 +7,39 @@ param(
     [string]$PackageSource = '',
     [ValidateRange(1, 60)][int]$EnvironmentWaitMinutes = 25,
     [switch]$ProvisionOnly,
-    [switch]$DeployOnly
+    [switch]$DeployOnly,
+    [switch]$Plan,
+    [string]$RollbackManifest = '',
+    [switch]$ConfirmSchemaCompatibility
 )
 $ErrorActionPreference = 'Stop'
 if ($ProvisionOnly -and $DeployOnly) { throw 'Choose either ProvisionOnly or DeployOnly.' }
+if ($RollbackManifest -and ($ProvisionOnly -or $DeployOnly -or $LocalDatabase)) {
+    throw 'Application rollback is a separate operation; do not combine it with provisioning, deployment or migration.'
+}
+if ($RollbackManifest -and -not $Plan -and -not $ConfirmSchemaCompatibility) {
+    throw 'Verify the previous application against the current schema and data before using -ConfirmSchemaCompatibility.'
+}
+if ($ConfirmSchemaCompatibility -and -not $RollbackManifest) { throw 'Schema compatibility confirmation applies only to rollback.' }
+. (Join-Path $PSScriptRoot 'Web-Release.ps1')
+if ($Plan) {
+    [pscustomobject]@{
+        Mode = if ($RollbackManifest) { 'ApplicationRollback' } elseif ($ProvisionOnly) { 'ProvisionOnly' } elseif ($DeployOnly) { 'DeployOnly' } else { 'ProvisionAndDeploy' }
+        SqlBaseline = @('--service-objective', 'S0', '--max-size', '250GB')
+        SqlMaxSizeBytes = 268435456000
+        TemporarySqlScale = @(if ($LocalDatabase -and -not $ProvisionOnly) { '--service-objective'; 'S3' })
+        RollbackRequiresSchemaConfirmation = $true
+        Probes = @(Get-WebProbes)
+    } | ConvertTo-Json -Depth 6
+    return
+}
 $root = Split-Path $PSScriptRoot -Parent
 $output = Join-Path $root 'artifacts\cloud'
 New-Item -ItemType Directory -Force $output | Out-Null
 $project = Join-Path $root 'src\ChessTrainer.Web'
 function AzJson {
     param([string[]]$Arguments)
-    $result = & az @Arguments --only-show-errors --output json
+    $result = & az @Arguments --only-show-errors --output json 2>$null
     if ($LASTEXITCODE -ne 0) { throw "Azure operation failed: $($Arguments[0..1] -join ' ')" }
     if ($result) { ($result -join "`n") | ConvertFrom-Json }
 }
@@ -29,7 +51,7 @@ function ProtectCloudEntry {
         '--require-https', 'true', '--excluded-paths', $publicPaths) | Out-Null
 }
 $account = AzJson @('account', 'show')
-$user = AzJson @('ad', 'signed-in-user', 'show')
+if (-not $RollbackManifest) { $user = AzJson @('ad', 'signed-in-user', 'show') }
 $suffix = $account.id.Substring(0, 8)
 $web = "chess-trainer-web-$suffix"
 $server = if ($SqlServerName) { $SqlServerName } else { "chess-trainer-sql-$suffix-central" }
@@ -37,7 +59,7 @@ $registry = "chesstrainer$suffix"
 $environment = 'chess-trainer-cloud-environment'
 $database = 'trainer'
 $statePath = Join-Path $output 'deployment.json'
-if (-not $DeployOnly) {
+if (-not $DeployOnly -and -not $RollbackManifest) {
     AzJson @('group', 'create', '--name', $ResourceGroup, '--location', $Location,
         '--tags', 'project=chess-trainer', 'workload=web-mobile') | Out-Null
     AzJson @('acr', 'create', '--name', $registry, '--resource-group', $ResourceGroup,
@@ -108,23 +130,15 @@ if (-not $DeployOnly) {
     $vision = AzJson @('cognitiveservices', 'account', 'show', '--name', "chess-trainer-vision-$suffix", '--resource-group', 'rg-chess-trainer-ai')
     AzJson @('role', 'assignment', 'create', '--assignee-object-id', $identity.principalId,
         '--assignee-principal-type', 'ServicePrincipal', '--role', '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd', '--scope', $vision.id) | Out-Null
-    $sql = "Server=tcp:$server.database.windows.net,1433;Database=$database;Encrypt=True;TrustServerCertificate=False;Connection Timeout=60;"
-    $applicationEnvironment = @("AZURE_CLIENT_ID=$($identity.clientId)", "Authentication__TenantId=$($account.tenantId)",
-        "Authentication__OwnerId=$($user.id)", "ConnectionStrings__Trainer=$sql",
-        "Vision__Endpoint=https://chess-trainer-vision-$suffix.openai.azure.com/", 'Vision__Deployment=chess-vision',
-        'ASPNETCORE_FORWARDEDHEADERS_ENABLED=true', 'ASPNETCORE_HTTP_PORTS=8080')
     $existingApp = @(AzJson @('containerapp', 'list', '--resource-group', $ResourceGroup)) | Where-Object name -eq $web
     if (-not $existingApp) {
         AzJson (@('containerapp', 'create', '--name', $web, '--resource-group', $ResourceGroup,
             '--environment', $environment, '--image', 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest',
             '--ingress', 'external', '--target-port', '80', '--cpu', '0.5', '--memory', '1Gi',
-            '--min-replicas', '0', '--max-replicas', '1', '--user-assigned', $identity.id, '--env-vars') + $applicationEnvironment) | Out-Null
+            '--min-replicas', '0', '--max-replicas', '1', '--revisions-mode', 'single', '--user-assigned', $identity.id)) | Out-Null
     }
     elseif ($existingApp.properties.environmentId -ne $managedEnvironment.id) {
         throw 'The existing app belongs to a different environment. Migrate it explicitly before continuing.'
-    }
-    else {
-        AzJson (@('containerapp', 'update', '--name', $web, '--resource-group', $ResourceGroup, '--set-env-vars') + $applicationEnvironment) | Out-Null
     }
     $app = AzJson @('containerapp', 'show', '--name', $web, '--resource-group', $ResourceGroup)
     $url = "https://$($app.properties.configuration.ingress.fqdn)"
@@ -170,7 +184,9 @@ $server = $state.SqlServer
 $database = $state.Database
 $registry = $state.Registry
 $environment = $state.Environment
+if ($RollbackManifest) { Restore-WebRelease $RollbackManifest; return }
 if ($ProvisionOnly) { Write-Output "Provisioned $($state.Url). Ready for private-network database initialization and app deployment."; return }
+Assert-WebReleaseMode (Get-WebApp)
 ProtectCloudEntry $web $ResourceGroup
 $runtimeIdentity = AzJson @('identity', 'show', '--ids', $state.IdentityId)
 $runtimeClientId = [guid]::Empty
@@ -192,22 +208,25 @@ function PublishImage {
     & dotnet @arguments
     if ($LASTEXITCODE -ne 0) { throw "Container publish failed: $Repository." }
 }
-$tag = Get-Date -Format 'yyyyMMddHHmmss'
+$tag = 'r' + (Get-Date -Format 'yyyyMMddHHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 6)
 $job = 'chess-trainer-bootstrap'
 $snapshot = Join-Path $output "migration-$tag.db"
 $migrationPublish = Join-Path $output "migration-publish-$tag"
 $bootstrapSucceeded = $false
 $administratorChanged = $false
 $scaled = $false
-$env:DOTNET_CONTAINER_REGISTRY_UNAME = '00000000-0000-0000-0000-000000000000'
-$token = AzJson @('acr', 'login', '--name', $registry, '--expose-token')
-$env:DOTNET_CONTAINER_REGISTRY_PWORD = $token.accessToken
+$sql = "Server=tcp:$server.database.windows.net,1433;Database=$database;Encrypt=True;TrustServerCertificate=False;Connection Timeout=60;"
 try {
+    $env:DOTNET_CONTAINER_REGISTRY_UNAME = '00000000-0000-0000-0000-000000000000'
+    $token = AzJson @('acr', 'login', '--name', $registry, '--expose-token')
+    $env:DOTNET_CONTAINER_REGISTRY_PWORD = $token.accessToken
     $restore = @('restore', $project, '--runtime', 'linux-x64', '--verbosity', 'quiet')
     if ($PackageSource) { $restore += @('--source', $PackageSource) }
     & dotnet @restore
     if ($LASTEXITCODE -ne 0) { throw 'Linux restore failed.' }
     PublishImage 'chess-trainer' $tag (Join-Path $output 'web-publish')
+    $image = Resolve-WebImage "$registry.azurecr.io/chess-trainer:$tag"
+    $releaseRecord = Save-WebReleaseRecord $tag $image
     if ($LocalDatabase) {
         & dotnet run --project $project --no-restore --no-launch-profile -- --task snapshot --source-db $LocalDatabase --destination-db $snapshot
         if ($LASTEXITCODE -ne 0) { throw 'Source database snapshot failed.' }
@@ -224,7 +243,7 @@ try {
         AzJson @('sql', 'db', 'update', '--name', $database, '--server', $server, '--resource-group', $ResourceGroup, '--service-objective', 'S3') | Out-Null
     }
     $jobEnvironment = @('task=bootstrap', "AZURE_CLIENT_ID=$($bootstrap.clientId)", "Authentication__OwnerId=$($state.OwnerId)",
-        "ConnectionStrings__Trainer=Server=tcp:$server.database.windows.net,1433;Database=$database;Encrypt=True;TrustServerCertificate=False;Connection Timeout=60;",
+        "ConnectionStrings__Trainer=$sql",
         "Bootstrap__ApplicationName=$web", "Bootstrap__ClientId=$runtimeClientId")
     $repository = 'chess-trainer'
     if ($LocalDatabase) { $jobEnvironment += 'Bootstrap__SourceDatabase=/app/migration/trainer.db'; $repository = 'chess-trainer-migrate' }
@@ -261,9 +280,13 @@ finally {
         if ($administratorChanged) { SetSqlAdministrator $user.userPrincipalName $user.id }
     }
     finally {
-        if ($scaled) { AzJson @('sql', 'db', 'update', '--name', $database, '--server', $server, '--resource-group', $ResourceGroup, '--service-objective', 'S0') | Out-Null }
-        Remove-Item Env:\DOTNET_CONTAINER_REGISTRY_UNAME, Env:\DOTNET_CONTAINER_REGISTRY_PWORD -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $snapshot, (Join-Path $migrationPublish 'migration\trainer.db') -ErrorAction SilentlyContinue
+        try {
+            if ($scaled) { AzJson @('sql', 'db', 'update', '--name', $database, '--server', $server, '--resource-group', $ResourceGroup, '--service-objective', 'S0') | Out-Null }
+        }
+        finally {
+            Remove-Item Env:\DOTNET_CONTAINER_REGISTRY_UNAME, Env:\DOTNET_CONTAINER_REGISTRY_PWORD -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $snapshot, (Join-Path $migrationPublish 'migration\trainer.db') -ErrorAction SilentlyContinue
+        }
     }
 }
 if ($bootstrapSucceeded) {
@@ -272,16 +295,11 @@ if ($bootstrapSucceeded) {
     AzJson @('identity', 'delete', '--name', $job, '--resource-group', $ResourceGroup) | Out-Null
     if ($LocalDatabase) { AzJson @('acr', 'repository', 'delete', '--name', $registry, '--image', "chess-trainer-migrate:$tag", '--yes') | Out-Null }
 }
-AzJson @('containerapp', 'ingress', 'update', '--name', $web, '--resource-group', $ResourceGroup, '--target-port', '8080') | Out-Null
-AzJson @('containerapp', 'update', '--name', $web, '--resource-group', $ResourceGroup, '--image', "$registry.azurecr.io/chess-trainer:$tag") | Out-Null
-$ready = $false
-for ($attempt = 0; $attempt -lt 20; $attempt++) {
-    try {
-        $response = Invoke-RestMethod "$($state.Url)/health/ready" -TimeoutSec 30
-        if ($response.status -eq 'ready') { $ready = $true; break }
-    }
-    catch { Write-Warning "Readiness check has not passed: $($_.Exception.Message)" }
-    Start-Sleep -Seconds 15
+$applicationEnvironment = @{
+    AZURE_CLIENT_ID = "$runtimeClientId"; Authentication__TenantId = $state.TenantId; Authentication__OwnerId = $state.OwnerId
+    ConnectionStrings__Trainer = $sql; Vision__Endpoint = "https://chess-trainer-vision-$suffix.openai.azure.com/"
+    Vision__Deployment = 'chess-vision'; ASPNETCORE_FORWARDEDHEADERS_ENABLED = 'true'; ASPNETCORE_HTTP_PORTS = '8080'; Release__Id = $tag
 }
-if (-not $ready) { throw 'Deployment did not become ready. Inspect Container Apps revision and console diagnostics.' }
-Write-Output "Deployed $($state.Url)"
+Start-WebCandidate $releaseRecord $tag $applicationEnvironment
+Wait-WebRelease $releaseRecord.CandidateRevision $image $tag
+Write-Output "Deployed and verified $($state.Url): $($releaseRecord.CandidateRevision) ($image). Authenticated owner smoke tests are separate."
