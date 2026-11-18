@@ -162,7 +162,7 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
                     <div class="section-heading"><h2>@(editingPosition is null ? "Add a position" : "Edit position")</h2><button @onclick="NewPosition">New position</button></div>
                     <fieldset class="source-choices"><legend>Import source</legend>
                         @foreach (string source in new[] { "Paste FEN", "CSV file", "Screenshot (Azure AI)" })
-                        { <button class="@(importSource == source ? "selected" : "")" aria-pressed="@(importSource == source)" @onclick="() => importSource = source">@source</button> }
+                        { <button class="@(importSource == source ? "selected" : "")" aria-pressed="@(importSource == source)" @onclick="() => SetImportSource(source)">@source</button> }
                     </fieldset>
                     @if (importSource == "CSV file")
                     {
@@ -176,8 +176,10 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
                         <button @onclick="PasteScreenshot">Paste screenshot</button>
                         <img id="local-screenshot-preview" class="screenshot-preview" hidden alt="Position screenshot awaiting transcription" />
                         <label>Screenshot orientation<select @bind="blackAtBottom"><option value="false">White at bottom</option><option value="true">Black at bottom</option></select></label>
-                        <label class="check"><input type="checkbox" @bind="imageConsent" /> Send this image to Azure AI to replace the FEN below. Azure usage charges apply.</label>
-                        <button disabled="@(!screenshotReady || !imageConsent)" @onclick="Recognize">Generate FEN with Azure AI</button>
+                        <label class="check"><input type="checkbox" checked="@(screenshotGeneration is not null && consentedScreenshotGeneration == screenshotGeneration)"
+                            disabled="@(!screenshotReady)" @onchange="ScreenshotConsentChanged" /> Send this image to Azure AI to replace the FEN below. Azure usage charges apply.</label>
+                        <button disabled="@(!screenshotReady || screenshotGeneration is null || consentedScreenshotGeneration != screenshotGeneration)"
+                            @onclick="Recognize">Generate FEN with Azure AI</button>
                         @if (visionNote is not null) { <p role="status">@visionNote</p> }
                         <p class="muted">AI returns placement only. Verify side to move, castling, en-passant rights and counters before saving.</p>
                     }
@@ -238,7 +240,7 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
 @code {
     private ClaimsPrincipal user = new();
     private string? owner;
-    private bool loading = true, busy, flipped, blackAtBottom, imageConsent, aiGenerated, fenReviewed, moreHistory, screenshotReady;
+    private bool loading = true, busy, flipped, blackAtBottom, aiGenerated, fenReviewed, moreHistory, screenshotReady;
     private string page = "Practice", theme = "light", pieces = "chessnut", boardId = "sage";
     private string? error, message, selectedSquare, promotionMove, visionNote, previewFen;
     private int minimum = 800, maximum = 2000;
@@ -249,6 +251,8 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
     private IReadOnlyList<StudyPosition> positions = [];
     private IReadOnlyList<HistoryItem> history = [];
     private Guid? selectedStudy, editingPosition, destination;
+    private long screenshotConsentRevision;
+    private string? screenshotGeneration, consentedScreenshotGeneration;
     private string studyName = "", positionTitle = "", positionFen = "", solution = "", positionNotes = "", importSource = "Paste FEN";
     private DotNetObjectReference<Home>? reference;
     private bool jsInitialized;
@@ -291,8 +295,8 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
             await JS.InvokeVoidAsync("chess.connect", reference);
             jsInitialized = true;
         }
-        if (page == "Studies" && importSource == "Screenshot (Azure AI)")
-            await JS.InvokeVoidAsync(screenshotReady ? "chess.showScreenshot" : "chess.clearScreenshot");
+        if (page == "Studies" && importSource == "Screenshot (Azure AI)" && screenshotReady)
+            await JS.InvokeVoidAsync("chess.showScreenshot");
     }
 
     private async Task Run(Func<Task> action)
@@ -317,6 +321,7 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
         {
             if (tab == "Results") await ReadHistory();
             if (tab == "Studies") studies = await Store.StudiesAsync(owner!);
+            if (tab != "Studies" && page == "Studies") await JS.InvokeVoidAsync("chess.clearScreenshot");
             page = tab;
         });
     }
@@ -418,7 +423,9 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
     private void NewPosition()
     {
         editingPosition = null; positionTitle = positionFen = solution = positionNotes = "";
-        previewFen = visionNote = null; aiGenerated = fenReviewed = imageConsent = screenshotReady = false; destination = null;
+        previewFen = visionNote = null; aiGenerated = fenReviewed = screenshotReady = false; destination = null;
+        screenshotGeneration = consentedScreenshotGeneration = null; screenshotConsentRevision++;
+        _ = JS.InvokeVoidAsync("chess.clearScreenshot");
     }
     private void EditPosition(StudyPosition position)
     {
@@ -460,22 +467,59 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
         positions = await Store.PositionsAsync(owner!, study); message = $"Imported {imported.Count} positions.";
     });
     private Task PreviewPosition() => Run(() => { previewFen = StudyPosition.ValidateFen(positionFen); return Task.CompletedTask; });
+    private void SetImportSource(string source)
+    {
+        importSource = source;
+        if (source != "Screenshot (Azure AI)") _ = JS.InvokeVoidAsync("chess.clearScreenshot");
+    }
+
     private async Task PasteScreenshot()
     {
         try { await JS.InvokeVoidAsync("chess.paste"); }
         catch (JSException ex) { Logger.LogWarning(ex, "Clipboard access failed."); error = ex.Message; }
     }
-    [JSInvokable] public Task ScreenshotReady() => Run(() =>
+    [JSInvokable] public Task ScreenshotSelectionChanged(string? generation, bool ready, string errorText)
     {
-        screenshotReady = true; imageConsent = false; visionNote = "Screenshot ready. Confirm the orientation before generating FEN.";
+        screenshotConsentRevision++;
+        screenshotGeneration = generation;
+        consentedScreenshotGeneration = null;
+        screenshotReady = ready;
+        if (ready) visionNote = "Screenshot ready. Confirm the orientation before generating FEN.";
+        else
+        {
+            visionNote = null;
+            if (!string.IsNullOrEmpty(errorText)) error = errorText;
+        }
         StateHasChanged(); return Task.CompletedTask;
-    });
-    [JSInvokable] public Task ImageError(string text) { error = text; StateHasChanged(); return Task.CompletedTask; }
+    }
+    private async Task ScreenshotConsentChanged(ChangeEventArgs args)
+    {
+        long revision = ++screenshotConsentRevision;
+        if (args.Value is not bool consent || !consent)
+        {
+            consentedScreenshotGeneration = null;
+            return;
+        }
+        string? currentGeneration = await JS.InvokeAsync<string?>("chess.getScreenshotGeneration");
+        if (revision != screenshotConsentRevision) return;
+        if (screenshotReady && currentGeneration is not null && currentGeneration == screenshotGeneration)
+            consentedScreenshotGeneration = currentGeneration;
+        else
+            consentedScreenshotGeneration = null;
+    }
     private Task Recognize() => Run(async () =>
     {
-        if (!imageConsent || !screenshotReady) throw new InvalidOperationException("Choose a screenshot and confirm the upload first.");
-        string png = await JS.InvokeAsync<string>("chess.getScreenshot");
+        string? generation = screenshotGeneration;
+        if (!screenshotReady || generation is null || consentedScreenshotGeneration != generation)
+            throw new InvalidOperationException("Choose a screenshot and confirm the upload first.");
+        string png = await JS.InvokeAsync<string>("chess.getScreenshot", generation);
+        bool stillCurrent = await JS.InvokeAsync<bool>("chess.isScreenshotCurrent", generation);
+        if (!stillCurrent || generation != screenshotGeneration || generation != consentedScreenshotGeneration)
+            throw new InvalidOperationException("The selected screenshot changed. Confirm the displayed image again before generating FEN.");
         var result = await Vision.RecognizeAsync(user, new(png, blackAtBottom));
+        stillCurrent = await JS.InvokeAsync<bool>("chess.isScreenshotCurrent", generation);
+        if (!stillCurrent || generation != screenshotGeneration || generation != consentedScreenshotGeneration)
+            throw new InvalidOperationException("The selected screenshot changed while recognition was running. Its result was not applied.");
         positionFen = $"{result.Placement} w - - 0 1"; aiGenerated = true; fenReviewed = false;
         visionNote = "FEN generated. Review it before saving. " + result.Uncertainties;
     });
