@@ -23,20 +23,32 @@ public sealed class CloudStore(IConfiguration configuration, TokenCredential cre
 {
     private bool IsSqlite => !string.IsNullOrEmpty(configuration["Storage:SqlitePath"]);
 
-    private async Task<DbConnection> OpenAsync()
+    private async Task<DbConnection> OpenAsync(CancellationToken cancellationToken = default)
     {
-        DbConnection connection;
-        if (IsSqlite)
-            connection = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = configuration["Storage:SqlitePath"] }.ToString());
-        else
+        DbConnection? connection = null;
+        try
         {
-            var sql = new SqlConnection(configuration.GetConnectionString("Trainer")
-                ?? throw new InvalidOperationException("Configure the Trainer SQL connection string."));
-            sql.AccessToken = (await credential.GetTokenAsync(new TokenRequestContext(["https://database.windows.net/.default"]), default)).Token;
-            connection = sql;
+            if (IsSqlite)
+            {
+                connection = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = configuration["Storage:SqlitePath"] }.ToString());
+                await connection.OpenAsync(cancellationToken);
+            }
+            else
+            {
+                var sql = new SqlConnection(configuration.GetConnectionString("Trainer")
+                    ?? throw new InvalidOperationException("Configure the Trainer SQL connection string."));
+                connection = sql;
+                sql.AccessToken = (await credential.GetTokenAsync(
+                    new TokenRequestContext(["https://database.windows.net/.default"]), cancellationToken)).Token;
+                await SqlConnectionRetry.OpenAsync(sql, cancellationToken);
+            }
+            return connection;
         }
-        try { await connection.OpenAsync(); return connection; }
-        catch { await connection.DisposeAsync(); throw; }
+        catch
+        {
+            if (connection is not null) await connection.DisposeAsync();
+            throw;
+        }
     }
 
     internal static DbCommand Command(DbConnection connection, string sql, params (string Name, object Value)[] parameters)
@@ -172,9 +184,9 @@ public sealed class CloudStore(IConfiguration configuration, TokenCredential cre
         return Convert.ToInt64(await command.ExecuteScalarAsync());
     }
 
-    public async Task CheckReadyAsync()
+    public async Task CheckReadyAsync(CancellationToken cancellationToken = default)
     {
-        await using var connection = await OpenAsync();
+        await using var connection = await OpenAsync(cancellationToken);
         foreach (string query in new[]
         {
             "SELECT p.Id FROM CloudPuzzles p JOIN CloudPuzzleRatings r ON p.Rating=r.Rating WHERE 1=0",
@@ -183,7 +195,7 @@ public sealed class CloudStore(IConfiguration configuration, TokenCredential cre
         })
         {
             await using var command = Command(connection, query);
-            await using var reader = await command.ExecuteReaderAsync();
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         }
     }
 

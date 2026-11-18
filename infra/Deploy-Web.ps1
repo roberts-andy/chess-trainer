@@ -9,25 +9,29 @@ param(
     [switch]$ProvisionOnly,
     [switch]$DeployOnly,
     [switch]$Plan,
+    [switch]$ScaleForMigration,
     [string]$RollbackManifest = '',
     [switch]$ConfirmSchemaCompatibility
 )
 $ErrorActionPreference = 'Stop'
 if ($ProvisionOnly -and $DeployOnly) { throw 'Choose either ProvisionOnly or DeployOnly.' }
-if ($RollbackManifest -and ($ProvisionOnly -or $DeployOnly -or $LocalDatabase)) {
+if ($RollbackManifest -and ($ProvisionOnly -or $DeployOnly -or $LocalDatabase -or $ScaleForMigration)) {
     throw 'Application rollback is a separate operation; do not combine it with provisioning, deployment or migration.'
 }
 if ($RollbackManifest -and -not $Plan -and -not $ConfirmSchemaCompatibility) {
     throw 'Verify the previous application against the current schema and data before using -ConfirmSchemaCompatibility.'
 }
 if ($ConfirmSchemaCompatibility -and -not $RollbackManifest) { throw 'Schema compatibility confirmation applies only to rollback.' }
+if ($ScaleForMigration -and (-not $LocalDatabase -or $ProvisionOnly)) { throw 'Temporary scale requires a local database migration.' }
 . (Join-Path $PSScriptRoot 'Web-Release.ps1')
+$sqlBaseline = @('--service-objective', 'GP_S_Gen5_1', '--min-capacity', '0.5', '--max-size', '32GB', '--auto-pause-delay', '60')
+$sqlMigrationTier = @('--service-objective', 'GP_Gen5_2', '--max-size', '32GB')
 if ($Plan) {
     [pscustomobject]@{
         Mode = if ($RollbackManifest) { 'ApplicationRollback' } elseif ($ProvisionOnly) { 'ProvisionOnly' } elseif ($DeployOnly) { 'DeployOnly' } else { 'ProvisionAndDeploy' }
-        SqlBaseline = @('--service-objective', 'S0', '--max-size', '250GB')
-        SqlMaxSizeBytes = 268435456000
-        TemporarySqlScale = @(if ($LocalDatabase -and -not $ProvisionOnly) { '--service-objective'; 'S3' })
+        SqlBaseline = $sqlBaseline
+        SqlMaxSizeBytes = 34359738368
+        TemporarySqlScale = @(if ($ScaleForMigration) { $sqlMigrationTier })
         RollbackRequiresSchemaConfirmation = $true
         Probes = @(Get-WebProbes)
     } | ConvertTo-Json -Depth 6
@@ -50,6 +54,21 @@ function ProtectCloudEntry {
         '--enabled', 'true', '--unauthenticated-client-action', 'RedirectToLoginPage', '--redirect-provider', 'azureActiveDirectory',
         '--require-https', 'true', '--excluded-paths', $publicPaths) | Out-Null
 }
+function Assert-SqlBaseline($SqlDatabase) {
+    if ($SqlDatabase.currentServiceObjectiveName -ne 'GP_S_Gen5_1' -or
+        $SqlDatabase.sku.tier -ne 'GeneralPurpose' -or $SqlDatabase.sku.name -ne 'GP_S_Gen5' -or
+        $SqlDatabase.sku.family -ne 'Gen5' -or $SqlDatabase.sku.capacity -ne 1 -or
+        $SqlDatabase.minCapacity -ne 0.5 -or $SqlDatabase.maxSizeBytes -ne 34359738368 -or
+        $SqlDatabase.autoPauseDelay -ne 60) {
+        throw 'Azure SQL did not report the required GP_S_Gen5_1 baseline. Inspect the database configuration before deploying.'
+    }
+}
+function Set-SqlBaseline {
+    $sqlDb = AzJson @('sql', 'db', 'show', '--name', $database, '--server', $server, '--resource-group', $ResourceGroup)
+    try { Assert-SqlBaseline $sqlDb; return } catch { }
+    AzJson (@('sql', 'db', 'update', '--name', $database, '--server', $server, '--resource-group', $ResourceGroup) + $sqlBaseline) | Out-Null
+    Assert-SqlBaseline (AzJson @('sql', 'db', 'show', '--name', $database, '--server', $server, '--resource-group', $ResourceGroup))
+}
 $account = AzJson @('account', 'show')
 if (-not $RollbackManifest) { $user = AzJson @('ad', 'signed-in-user', 'show') }
 $suffix = $account.id.Substring(0, 8)
@@ -68,14 +87,21 @@ if (-not $DeployOnly -and -not $RollbackManifest) {
     $acr = AzJson @('acr', 'show', '--name', $registry, '--resource-group', $ResourceGroup)
     AzJson @('role', 'assignment', 'create', '--assignee-object-id', $identity.principalId,
         '--assignee-principal-type', 'ServicePrincipal', '--role', 'AcrPull', '--scope', $acr.id) | Out-Null
-    AzJson @('sql', 'server', 'create', '--name', $server, '--resource-group', $ResourceGroup,
-        '--location', $SqlLocation, '--enable-public-network', 'false', '--enable-ad-only-auth',
-        '--external-admin-principal-type', 'User', '--external-admin-name', $user.userPrincipalName,
-        '--external-admin-sid', $user.id) | Out-Null
-    AzJson @('sql', 'db', 'create', '--name', $database, '--server', $server, '--resource-group', $ResourceGroup,
-        '--service-objective', 'S0', '--max-size', '250GB', '--backup-storage-redundancy', 'Local') | Out-Null
+    $servers = @(AzJson @('sql', 'server', 'list', '--resource-group', $ResourceGroup))
+    if ($server -notin $servers.name) {
+        AzJson @('sql', 'server', 'create', '--name', $server, '--resource-group', $ResourceGroup,
+            '--location', $SqlLocation, '--enable-public-network', 'false', '--enable-ad-only-auth',
+            '--external-admin-principal-type', 'User', '--external-admin-name', $user.userPrincipalName,
+            '--external-admin-sid', $user.id) | Out-Null
+    }
     $sqlServer = AzJson @('sql', 'server', 'show', '--name', $server, '--resource-group', $ResourceGroup)
     if ($sqlServer.publicNetworkAccess -ne 'Disabled') { throw 'The SQL server must have public network access disabled.' }
+    $databases = @(AzJson @('sql', 'db', 'list', '--server', $server, '--resource-group', $ResourceGroup))
+    if ($database -notin $databases.name) {
+        AzJson (@('sql', 'db', 'create', '--name', $database, '--server', $server, '--resource-group', $ResourceGroup,
+            '--backup-storage-redundancy', 'Local') + $sqlBaseline) | Out-Null
+    }
+    Set-SqlBaseline
 
     $feature = AzJson @('feature', 'show', '--namespace', 'Microsoft.Network', '--name', 'AllowBringYourOwnPublicIpAddress')
     if ($feature.properties.state -ne 'Registered') {
@@ -110,8 +136,12 @@ if (-not $DeployOnly -and -not $RollbackManifest) {
             '--location', $Location, '--subnet', $dataSubnet.id, '--private-connection-resource-id', $sqlServer.id,
             '--group-id', 'sqlServer', '--connection-name', 'trainer-sql') | Out-Null
     }
-    AzJson @('network', 'private-endpoint', 'dns-zone-group', 'create', '--endpoint-name', 'chess-trainer-sql-private',
-        '--name', 'default', '--resource-group', $ResourceGroup, '--private-dns-zone', $zone.id, '--zone-name', 'sql') | Out-Null
+    $dnsGroups = @(AzJson @('network', 'private-endpoint', 'dns-zone-group', 'list',
+        '--endpoint-name', 'chess-trainer-sql-private', '--resource-group', $ResourceGroup))
+    if ('default' -notin $dnsGroups.name) {
+        AzJson @('network', 'private-endpoint', 'dns-zone-group', 'create', '--endpoint-name', 'chess-trainer-sql-private',
+            '--name', 'default', '--resource-group', $ResourceGroup, '--private-dns-zone', $zone.id, '--zone-name', 'sql') | Out-Null
+    }
 
     $existing = @(AzJson @('containerapp', 'env', 'list', '--resource-group', $ResourceGroup)) | Where-Object name -eq $environment
     if (-not $existing) {
@@ -215,7 +245,7 @@ $migrationPublish = Join-Path $output "migration-publish-$tag"
 $bootstrapSucceeded = $false
 $administratorChanged = $false
 $scaled = $false
-$sql = "Server=tcp:$server.database.windows.net,1433;Database=$database;Encrypt=True;TrustServerCertificate=False;Connection Timeout=60;"
+$sql = "Server=tcp:$server.database.windows.net,1433;Database=$database;Encrypt=True;TrustServerCertificate=False;Connection Timeout=20;Pooling=False;ConnectRetryCount=0;"
 try {
     $env:DOTNET_CONTAINER_REGISTRY_UNAME = '00000000-0000-0000-0000-000000000000'
     $token = AzJson @('acr', 'login', '--name', $registry, '--expose-token')
@@ -227,6 +257,7 @@ try {
     PublishImage 'chess-trainer' $tag (Join-Path $output 'web-publish')
     $image = Resolve-WebImage "$registry.azurecr.io/chess-trainer:$tag"
     $releaseRecord = Save-WebReleaseRecord $tag $image
+    Set-SqlBaseline
     if ($LocalDatabase) {
         & dotnet run --project $project --no-restore --no-launch-profile -- --task snapshot --source-db $LocalDatabase --destination-db $snapshot
         if ($LASTEXITCODE -ne 0) { throw 'Source database snapshot failed.' }
@@ -238,9 +269,9 @@ try {
         '--assignee-principal-type', 'ServicePrincipal', '--role', 'AcrPull', '--scope', $acr.id)
     $administratorChanged = $true
     SetSqlAdministrator $job $bootstrap.principalId
-    if ($LocalDatabase) {
+    if ($ScaleForMigration) {
         $scaled = $true
-        AzJson @('sql', 'db', 'update', '--name', $database, '--server', $server, '--resource-group', $ResourceGroup, '--service-objective', 'S3') | Out-Null
+        AzJson (@('sql', 'db', 'update', '--name', $database, '--server', $server, '--resource-group', $ResourceGroup) + $sqlMigrationTier) | Out-Null
     }
     $jobEnvironment = @('task=bootstrap', "AZURE_CLIENT_ID=$($bootstrap.clientId)", "Authentication__OwnerId=$($state.OwnerId)",
         "ConnectionStrings__Trainer=$sql",
@@ -281,7 +312,10 @@ finally {
     }
     finally {
         try {
-            if ($scaled) { AzJson @('sql', 'db', 'update', '--name', $database, '--server', $server, '--resource-group', $ResourceGroup, '--service-objective', 'S0') | Out-Null }
+            if ($scaled) {
+                try { Set-SqlBaseline }
+                catch { throw 'Temporary SQL capacity could not be restored. Verify the live SKU and restore GP_S_Gen5_1 before proceeding.' }
+            }
         }
         finally {
             Remove-Item Env:\DOTNET_CONTAINER_REGISTRY_UNAME, Env:\DOTNET_CONTAINER_REGISTRY_PWORD -ErrorAction SilentlyContinue

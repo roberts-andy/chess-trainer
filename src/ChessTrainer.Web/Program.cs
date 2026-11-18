@@ -123,7 +123,7 @@ app.MapGet("/health", (HttpContext context) =>
 app.MapGet("/health/ready", async (CloudStore store, HttpContext context) =>
 {
     context.Response.Headers.CacheControl = "no-store";
-    try { await store.CheckReadyAsync(); }
+    try { await store.CheckReadyAsync(context.RequestAborted); }
     catch (Exception error) when (error is DbException or TimeoutException or AuthenticationFailedException)
     {
         return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
