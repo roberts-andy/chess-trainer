@@ -214,6 +214,28 @@ public sealed class CloudTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task NewestDraftQueryIsIndependentOfBoundedHistory()
+    {
+        var puzzle = new Puzzle("drafts", Initial, "e2e4 e7e5", 1000, "", "");
+        var olderDraft = new TrainingSession(puzzle).Snapshot() with { StartedAt = DateTimeOffset.UtcNow.AddDays(-2) };
+        var newestDraft = new TrainingSession(puzzle).Snapshot() with { StartedAt = DateTimeOffset.UtcNow.AddDays(-1) };
+        await Store.SaveAttemptAsync(Owner, olderDraft, null);
+        await Store.SaveAttemptAsync(Owner, newestDraft, null);
+        for (int i = 0; i < 205; i++)
+        {
+            var submitted = new TrainingSession(puzzle);
+            submitted.Submit();
+            await Store.SaveAttemptAsync(Owner, submitted.Snapshot() with { StartedAt = DateTimeOffset.UtcNow.AddMinutes(i) }, null);
+        }
+
+        var firstPage = await Store.HistoryAsync(Owner);
+        Assert.Equal(200, firstPage.Count);
+        Assert.DoesNotContain(firstPage, item => item.Id == newestDraft.Id);
+        Assert.Equal(newestDraft.Id, (await Store.NewestDraftAsync(Owner))!.Id);
+        Assert.Null(await Store.NewestDraftAsync("another-owner"));
+    }
+
+    [Fact]
     public async Task ApiRejectsMissingAuthenticationForgedHeadersAndCrossSiteWrites()
     {
         using var anonymousFactory = Factory(false);

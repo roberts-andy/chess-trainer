@@ -282,7 +282,7 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
                 pieces = pieceSets.Contains(set) ? set! : "chessnut";
                 history = await Store.HistoryAsync(owner);
                 moreHistory = history.Count == 200;
-                if (history.FirstOrDefault(h => h.SubmittedAt is null) is { } draft) SetCurrent(await Training.ReadAsync(user, draft.Id));
+                if (await Store.NewestDraftAsync(owner) is { } draft) SetCurrent(await Training.ReadAsync(user, draft.Id));
             });
         }
         loading = false;

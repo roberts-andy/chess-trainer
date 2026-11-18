@@ -435,6 +435,29 @@ public sealed class CloudStore(IConfiguration configuration, TokenCredential cre
         return items;
     }
 
+    public async Task<HistoryItem?> NewestDraftAsync(string owner)
+    {
+        await using var connection = await OpenAsync();
+        await using var command = Command(connection, IsSqlite
+            ? """
+              SELECT Payload FROM CloudAttempts
+              WHERE OwnerId=@owner AND json_extract(Payload,'$.SubmittedAt') IS NULL
+                AND json_extract(Payload,'$.submittedAt') IS NULL
+              ORDER BY StartedAt DESC,Id DESC LIMIT 1
+              """
+            : """
+              SELECT TOP (1) Payload FROM CloudAttempts
+              WHERE OwnerId=@owner AND JSON_VALUE(Payload,'$.SubmittedAt') IS NULL
+                AND JSON_VALUE(Payload,'$.submittedAt') IS NULL
+              ORDER BY StartedAt DESC,Id DESC
+              """, ("@owner", owner));
+        object? payload = await command.ExecuteScalarAsync();
+        if (payload is not string json) return null;
+        var attempt = JsonSerializer.Deserialize<Attempt>(json)!;
+        return new(attempt.Id, attempt.Puzzle.Id, attempt.Puzzle.Rating, attempt.StartedAt, attempt.SubmittedAt,
+            attempt.Mode, attempt.Results?.FirstOrDefault()?.Verdict.ToString() ?? "Unsubmitted", attempt.Puzzle.Title, attempt.Puzzle.IsCustom);
+    }
+
     public async Task<string?> SettingAsync(string owner, string name)
     {
         await using var connection = await OpenAsync();
