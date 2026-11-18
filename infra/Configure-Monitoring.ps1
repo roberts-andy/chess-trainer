@@ -25,8 +25,9 @@ if (-not $Apply) {
         Requires = $required
         NotificationControls = if ($RetentionOnly) { 'Deferred; no action group or alert rules' } else { 'Require owner recipient' }
         Changes = @('Reuse an existing workspace with owner-approved retention; never change shared retention',
-            'Route environment console/system logs through Azure Monitor',
-            'Create a dedicated owner action group and passive app/SQL/vision metric alerts')
+            'Route environment console/system logs through Azure Monitor') + @(
+                if (-not $RetentionOnly) { 'Create a dedicated owner action group and passive app/SQL/vision metric alerts' }
+            )
         DoesNotDo = @('Create a workspace', 'Send a test notification', 'Call health or SQL endpoints',
             'Schedule credential expiry checks', 'Change scale-to-zero or database pause settings')
     } | ConvertTo-Json -Depth 5

@@ -59,8 +59,11 @@ function az {
 }
 
 $monitor = & "$root\infra\Configure-Monitoring.ps1" | ConvertFrom-Json
+$retentionPlan = & "$root\infra\Configure-Monitoring.ps1" -RetentionOnly | ConvertFrom-Json
 $cost = & "$root\infra\Manage-CostControls.ps1" | ConvertFrom-Json
 Assert-That ($monitor.Mode -eq 'PlanOnly' -and $cost.Mode -eq 'PlanOnly') 'Default modes must be offline plans.'
+Assert-That ($retentionPlan.Requires -notcontains 'NotificationEmail' -and
+    -not ($retentionPlan.Changes -match 'action group|metric alerts')) 'Retention-only plans must not promise notification changes.'
 Assert-That ($global:ChessOperationsTestState.Calls.Count -eq 0) 'Plans must not call Azure.'
 
 $global:ChessOperationsTestState.AllowAz = $true
