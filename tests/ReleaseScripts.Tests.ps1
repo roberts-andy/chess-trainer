@@ -45,6 +45,19 @@ try {
     Assert-SqlPrivateAccess @{ publicNetworkAccess = 'Disabled' }
     Assert-ReleaseFailure { Assert-SqlPrivateAccess @{ publicNetworkAccess = 'Enabled' } } '*must be Disabled*'
     Assert-ReleaseFailure { Assert-SqlPrivateAccess @{} } '*must be Disabled*'
+    $sql = @{
+        currentServiceObjectiveName = 'GP_S_Gen5_1'; minCapacity = 0.5
+        maxSizeBytes = 34359738368; autoPauseDelay = 60
+        sku = @{ tier = 'GeneralPurpose'; name = 'GP_S_Gen5_1'; family = 'Gen5'; capacity = 1 }
+    }
+    Assert-SqlBaseline $sql
+    $sql.sku.name = 'GP_S_Gen5'
+    Assert-SqlBaseline $sql
+    $sql.sku.capacity = 2
+    Assert-ReleaseFailure { Assert-SqlBaseline $sql } '*required GP_S_Gen5_1 baseline*'
+    $sql.sku.capacity = 1
+    $sql.autoPauseDelay = -1
+    Assert-ReleaseFailure { Assert-SqlBaseline $sql } '*required GP_S_Gen5_1 baseline*'
     $web = 'trainer-test'
     $ResourceGroup = 'release-tests'
     $output = $scratch

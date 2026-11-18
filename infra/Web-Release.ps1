@@ -17,6 +17,16 @@ function Assert-SqlPrivateAccess($Server) {
     }
 }
 
+function Assert-SqlBaseline($SqlDatabase) {
+    if ($SqlDatabase.currentServiceObjectiveName -ne 'GP_S_Gen5_1' -or
+        $SqlDatabase.sku.tier -ne 'GeneralPurpose' -or $SqlDatabase.sku.name -notin @('GP_S_Gen5', 'GP_S_Gen5_1') -or
+        $SqlDatabase.sku.family -ne 'Gen5' -or $SqlDatabase.sku.capacity -ne 1 -or
+        $SqlDatabase.minCapacity -ne 0.5 -or $SqlDatabase.maxSizeBytes -ne 34359738368 -or
+        $SqlDatabase.autoPauseDelay -ne 60) {
+        throw 'Azure SQL did not report the required GP_S_Gen5_1 baseline. Inspect the database configuration before deploying.'
+    }
+}
+
 function Get-WebRevision([string]$Revision) {
     AzJson @('containerapp', 'revision', 'show', '--name', $web, '--resource-group', $ResourceGroup, '--revision', $Revision)
 }

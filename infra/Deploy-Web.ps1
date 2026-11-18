@@ -54,15 +54,6 @@ function ProtectCloudEntry {
         '--enabled', 'true', '--unauthenticated-client-action', 'RedirectToLoginPage', '--redirect-provider', 'azureActiveDirectory',
         '--require-https', 'true', '--excluded-paths', $publicPaths) | Out-Null
 }
-function Assert-SqlBaseline($SqlDatabase) {
-    if ($SqlDatabase.currentServiceObjectiveName -ne 'GP_S_Gen5_1' -or
-        $SqlDatabase.sku.tier -ne 'GeneralPurpose' -or $SqlDatabase.sku.name -ne 'GP_S_Gen5' -or
-        $SqlDatabase.sku.family -ne 'Gen5' -or $SqlDatabase.sku.capacity -ne 1 -or
-        $SqlDatabase.minCapacity -ne 0.5 -or $SqlDatabase.maxSizeBytes -ne 34359738368 -or
-        $SqlDatabase.autoPauseDelay -ne 60) {
-        throw 'Azure SQL did not report the required GP_S_Gen5_1 baseline. Inspect the database configuration before deploying.'
-    }
-}
 function Set-SqlBaseline {
     $sqlDb = AzJson @('sql', 'db', 'show', '--name', $database, '--server', $server, '--resource-group', $ResourceGroup)
     try { Assert-SqlBaseline $sqlDb; return } catch { }
