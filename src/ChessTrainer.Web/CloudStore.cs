@@ -9,7 +9,15 @@ using Microsoft.Data.Sqlite;
 namespace ChessTrainer.Web;
 
 public sealed record SavedAttempt(Attempt Attempt, long Revision);
-public sealed class EditConflictException() : InvalidOperationException("This attempt changed on another device. Reload it before continuing.");
+public sealed record VersionedStudy(Guid Id, string Name, long Version)
+{
+    public Study ToStudy() => new(Id, Name);
+}
+public sealed record VersionedStudyPosition(Guid Id, Guid StudyId, string Title, string Fen, string Solution, string Notes, long Version)
+{
+    public StudyPosition ToPosition() => new(Id, StudyId, Title, Fen, Solution, Notes);
+}
+public sealed class EditConflictException() : InvalidOperationException("This item changed on another device. Your unsaved input is still here; reload the latest version before saving again.");
 
 public sealed class CloudStore(IConfiguration configuration, TokenCredential credential)
 {
@@ -54,8 +62,8 @@ public sealed class CloudStore(IConfiguration configuration, TokenCredential cre
         foreach (var (name, definition) in new[]
         {
             ("CloudPuzzles", $"Id {puzzleId} PRIMARY KEY,Fen {text} NOT NULL,Moves {text} NOT NULL,Rating int NOT NULL,Themes {text} NOT NULL,GameUrl {text} NOT NULL"),
-            ("CloudStudies", "Id varchar(36) PRIMARY KEY,OwnerId varchar(36) NOT NULL,Name nvarchar(200) NOT NULL"),
-            ("CloudPositions", $"Id varchar(36) PRIMARY KEY,StudyId varchar(36) NOT NULL,OwnerId varchar(36) NOT NULL,Title nvarchar(200) NOT NULL,Fen {text} NOT NULL,Solution {text} NOT NULL,Notes {text} NOT NULL"),
+            ("CloudStudies", "Id varchar(36) PRIMARY KEY,OwnerId varchar(36) NOT NULL,Name nvarchar(200) NOT NULL,Version bigint NOT NULL DEFAULT 0"),
+            ("CloudPositions", $"Id varchar(36) PRIMARY KEY,StudyId varchar(36) NOT NULL,OwnerId varchar(36) NOT NULL,Title nvarchar(200) NOT NULL,Fen {text} NOT NULL,Solution {text} NOT NULL,Notes {text} NOT NULL,Version bigint NOT NULL DEFAULT 0"),
             ("CloudAttempts", $"Id varchar(36) PRIMARY KEY,OwnerId varchar(36) NOT NULL,StartedAt varchar(40) NOT NULL,Payload {text} NOT NULL,Revision bigint NOT NULL"),
             ("CloudSettings", $"OwnerId varchar(36) NOT NULL,Name varchar(80) NOT NULL,Value {text} NOT NULL,PRIMARY KEY(OwnerId,Name)")
         })
@@ -63,6 +71,23 @@ public sealed class CloudStore(IConfiguration configuration, TokenCredential cre
             string guard = IsSqlite ? "" : $"IF OBJECT_ID('{name}','U') IS NULL ";
             await using var command = Command(connection, $"{guard}{prefix}{name}({definition})");
             await command.ExecuteNonQueryAsync();
+        }
+        foreach (var (table, column) in new[] { ("CloudStudies", "Version"), ("CloudPositions", "Version") })
+        {
+            string sql = IsSqlite
+                ? $"ALTER TABLE {table} ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                : $"IF COL_LENGTH('{table}','{column}') IS NULL ALTER TABLE {table} ADD {column} bigint NOT NULL CONSTRAINT DF_{table}_{column} DEFAULT 0 WITH VALUES";
+            if (IsSqlite)
+            {
+                await using var exists = Command(connection, $"PRAGMA table_info({table})");
+                await using var reader = await exists.ExecuteReaderAsync();
+                bool found = false;
+                while (await reader.ReadAsync()) found |= reader.GetString(1) == column;
+                await reader.DisposeAsync();
+                if (found) continue;
+            }
+            await using var upgrade = Command(connection, sql);
+            await upgrade.ExecuteNonQueryAsync();
         }
         foreach (var (name, table, columns) in new[]
         {
@@ -150,9 +175,16 @@ public sealed class CloudStore(IConfiguration configuration, TokenCredential cre
     public async Task CheckReadyAsync()
     {
         await using var connection = await OpenAsync();
-        await using var command = Command(connection,
-            "SELECT p.Id FROM CloudPuzzles p JOIN CloudPuzzleRatings r ON p.Rating=r.Rating WHERE 1=0");
-        await using var reader = await command.ExecuteReaderAsync();
+        foreach (string query in new[]
+        {
+            "SELECT p.Id FROM CloudPuzzles p JOIN CloudPuzzleRatings r ON p.Rating=r.Rating WHERE 1=0",
+            "SELECT Version FROM CloudStudies WHERE 1=0",
+            "SELECT Version FROM CloudPositions WHERE 1=0"
+        })
+        {
+            await using var command = Command(connection, query);
+            await using var reader = await command.ExecuteReaderAsync();
+        }
     }
 
     public async Task<Puzzle?> RandomPuzzleAsync(int minimum, int maximum, string? exclude)
@@ -207,15 +239,37 @@ public sealed class CloudStore(IConfiguration configuration, TokenCredential cre
         return items;
     }
 
-    public async Task SaveStudyAsync(string owner, Study study, bool create)
+    public async Task<IReadOnlyList<VersionedStudy>> StudiesWithVersionsAsync(string owner)
+    {
+        await using var connection = await OpenAsync();
+        await using var command = Command(connection, "SELECT Id,Name,Version FROM CloudStudies WHERE OwnerId=@owner ORDER BY Name,Id", ("@owner", owner));
+        await using var reader = await command.ExecuteReaderAsync();
+        var items = new List<VersionedStudy>();
+        while (await reader.ReadAsync()) items.Add(new(Guid.Parse(reader.GetString(0)), reader.GetString(1), reader.GetInt64(2)));
+        return items;
+    }
+
+    public async Task<long> SaveStudyAsync(string owner, Study study, bool create, long? expectedVersion = null)
     {
         if (string.IsNullOrWhiteSpace(study.Name) || study.Name.Trim().Length > 200) throw new ArgumentException("Enter a study name of 1 to 200 characters.");
         await using var connection = await OpenAsync();
         await using var command = Command(connection, create
-            ? "INSERT INTO CloudStudies(Id,OwnerId,Name) VALUES(@id,@owner,@name)"
-            : "UPDATE CloudStudies SET Name=@name WHERE Id=@id AND OwnerId=@owner",
-            ("@id", study.Id.ToString()), ("@owner", owner), ("@name", study.Name.Trim()));
-        if (await command.ExecuteNonQueryAsync() != 1) throw new KeyNotFoundException("Study not found.");
+            ? "INSERT INTO CloudStudies(Id,OwnerId,Name,Version) VALUES(@id,@owner,@name,0)"
+            : expectedVersion.HasValue
+                ? "UPDATE CloudStudies SET Name=@name,Version=Version+1 WHERE Id=@id AND OwnerId=@owner AND Version=@version"
+                : "UPDATE CloudStudies SET Name=@name,Version=Version+1 WHERE Id=@id AND OwnerId=@owner",
+            ("@id", study.Id.ToString()), ("@owner", owner), ("@name", study.Name.Trim()), ("@version", expectedVersion ?? 0));
+        if (await command.ExecuteNonQueryAsync() != 1)
+        {
+            if (create || !expectedVersion.HasValue || !await StudyExistsAsync(connection, owner, study.Id))
+                throw new KeyNotFoundException("Study not found.");
+            throw new EditConflictException();
+        }
+        if (create) return 0;
+        if (expectedVersion.HasValue) return expectedVersion.Value + 1;
+        await using var version = Command(connection, "SELECT Version FROM CloudStudies WHERE Id=@id AND OwnerId=@owner",
+            ("@id", study.Id.ToString()), ("@owner", owner));
+        return Convert.ToInt64(await version.ExecuteScalarAsync());
     }
 
     public async Task<IReadOnlyList<StudyPosition>> PositionsAsync(string owner, Guid study)
@@ -227,6 +281,18 @@ public sealed class CloudStore(IConfiguration configuration, TokenCredential cre
         var items = new List<StudyPosition>();
         while (await reader.ReadAsync()) items.Add(new(Guid.Parse(reader.GetString(0)), Guid.Parse(reader.GetString(1)),
             reader.GetString(2), reader.GetString(3), reader.GetString(4), reader.GetString(5)));
+        return items;
+    }
+
+    public async Task<IReadOnlyList<VersionedStudyPosition>> PositionsWithVersionsAsync(string owner, Guid study)
+    {
+        await using var connection = await OpenAsync();
+        await using var command = Command(connection, "SELECT Id,StudyId,Title,Fen,Solution,Notes,Version FROM CloudPositions WHERE OwnerId=@owner AND StudyId=@study ORDER BY Title,Id",
+            ("@owner", owner), ("@study", study.ToString()));
+        await using var reader = await command.ExecuteReaderAsync();
+        var items = new List<VersionedStudyPosition>();
+        while (await reader.ReadAsync()) items.Add(new(Guid.Parse(reader.GetString(0)), Guid.Parse(reader.GetString(1)),
+            reader.GetString(2), reader.GetString(3), reader.GetString(4), reader.GetString(5), reader.GetInt64(6)));
         return items;
     }
 
@@ -257,14 +323,77 @@ public sealed class CloudStore(IConfiguration configuration, TokenCredential cre
         foreach (var position in validated)
         {
             await using var command = Command(connection, create
-                ? "INSERT INTO CloudPositions(Id,StudyId,OwnerId,Title,Fen,Solution,Notes) VALUES(@id,@study,@owner,@title,@fen,@solution,@notes)"
-                : "UPDATE CloudPositions SET StudyId=@study,Title=@title,Fen=@fen,Solution=@solution,Notes=@notes WHERE Id=@id AND OwnerId=@owner",
+                ? "INSERT INTO CloudPositions(Id,StudyId,OwnerId,Title,Fen,Solution,Notes,Version) VALUES(@id,@study,@owner,@title,@fen,@solution,@notes,0)"
+                : "UPDATE CloudPositions SET StudyId=@study,Title=@title,Fen=@fen,Solution=@solution,Notes=@notes,Version=Version+1 WHERE Id=@id AND OwnerId=@owner",
                 ("@id", position.Id.ToString()), ("@study", study.ToString()), ("@owner", owner),
                 ("@title", position.Title), ("@fen", position.Fen), ("@solution", position.Solution), ("@notes", position.Notes));
             command.Transaction = transaction;
             if (await command.ExecuteNonQueryAsync() != 1) throw new KeyNotFoundException("Position not found.");
         }
         await transaction.CommitAsync();
+    }
+
+    public async Task SavePositionAsync(string owner, StudyPosition position, long expectedVersion)
+    {
+        if (position.Title.Length > 200 || position.Notes.Length > 50000 || position.Solution.Length > 20000)
+            throw new ArgumentException("Position text is too long.");
+        var validated = StudyPosition.Create(position.StudyId, position.Title, position.Fen, position.Solution, position.Notes) with { Id = position.Id };
+        await using var connection = await OpenAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+        await using var study = Command(connection, "SELECT COUNT(*) FROM CloudStudies WHERE Id=@study AND OwnerId=@owner",
+            ("@study", validated.StudyId.ToString()), ("@owner", owner));
+        study.Transaction = transaction;
+        if (Convert.ToInt64(await study.ExecuteScalarAsync()) != 1) throw new KeyNotFoundException("Study not found.");
+        await using var command = Command(connection, """
+            UPDATE CloudPositions SET Title=@title,Fen=@fen,Solution=@solution,Notes=@notes,Version=Version+1
+            WHERE Id=@id AND StudyId=@study AND OwnerId=@owner AND Version=@version
+            """,
+            ("@title", validated.Title), ("@fen", validated.Fen), ("@solution", validated.Solution), ("@notes", validated.Notes),
+            ("@id", validated.Id.ToString()), ("@study", validated.StudyId.ToString()), ("@owner", owner), ("@version", expectedVersion));
+        command.Transaction = transaction;
+        if (await command.ExecuteNonQueryAsync() != 1)
+        {
+            if (!await PositionExistsAsync(connection, transaction, owner, validated.Id)) throw new KeyNotFoundException("Position not found.");
+            throw new EditConflictException();
+        }
+        await transaction.CommitAsync();
+    }
+
+    public async Task MovePositionAsync(string owner, Guid id, Guid destinationStudy, long expectedVersion)
+    {
+        await using var connection = await OpenAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+        await using var study = Command(connection, "SELECT COUNT(*) FROM CloudStudies WHERE Id=@study AND OwnerId=@owner",
+            ("@study", destinationStudy.ToString()), ("@owner", owner));
+        study.Transaction = transaction;
+        if (Convert.ToInt64(await study.ExecuteScalarAsync()) != 1) throw new KeyNotFoundException("Study not found.");
+        await using var command = Command(connection, """
+            UPDATE CloudPositions SET StudyId=@study,Version=Version+1
+            WHERE Id=@id AND OwnerId=@owner AND Version=@version
+            """,
+            ("@study", destinationStudy.ToString()), ("@id", id.ToString()), ("@owner", owner), ("@version", expectedVersion));
+        command.Transaction = transaction;
+        if (await command.ExecuteNonQueryAsync() != 1)
+        {
+            if (!await PositionExistsAsync(connection, transaction, owner, id)) throw new KeyNotFoundException("Position not found.");
+            throw new EditConflictException();
+        }
+        await transaction.CommitAsync();
+    }
+
+    private static async Task<bool> StudyExistsAsync(DbConnection connection, string owner, Guid id)
+    {
+        await using var command = Command(connection, "SELECT COUNT(*) FROM CloudStudies WHERE Id=@id AND OwnerId=@owner",
+            ("@id", id.ToString()), ("@owner", owner));
+        return Convert.ToInt64(await command.ExecuteScalarAsync()) == 1;
+    }
+
+    private static async Task<bool> PositionExistsAsync(DbConnection connection, DbTransaction transaction, string owner, Guid id)
+    {
+        await using var command = Command(connection, "SELECT COUNT(*) FROM CloudPositions WHERE Id=@id AND OwnerId=@owner",
+            ("@id", id.ToString()), ("@owner", owner));
+        command.Transaction = transaction;
+        return Convert.ToInt64(await command.ExecuteScalarAsync()) == 1;
     }
 
     public async Task<SavedAttempt> AttemptAsync(string owner, Guid id)

@@ -26,12 +26,12 @@ public sealed class CloudTests : IAsyncLifetime
     private static ClaimsPrincipal User(string owner = Owner, string tenant = Tenant) =>
         new(new ClaimsIdentity([new Claim("oid", owner), new Claim("tid", tenant)], "Test"));
 
-    private WebApplicationFactory<Program> Factory(bool authenticated = true) => new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
+    private WebApplicationFactory<Program> Factory(bool authenticated = true, string? sqlitePath = null) => new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
     {
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, configuration) => configuration.AddInMemoryCollection(new Dictionary<string, string?>
         {
-            ["Storage:SqlitePath"] = Path.Combine(directory, "cloud.db"),
+            ["Storage:SqlitePath"] = sqlitePath ?? Path.Combine(directory, "cloud.db"),
             ["Authentication:OwnerId"] = Owner,
             ["Authentication:TenantId"] = Tenant,
             ["Authentication:DevelopmentIdentity"] = authenticated.ToString()
@@ -134,6 +134,83 @@ public sealed class CloudTests : IAsyncLifetime
         var access = factory.Services.GetRequiredService<CloudAccess>();
         Assert.Throws<UnauthorizedAccessException>(() => access.Owner(User(tenant: Guid.NewGuid().ToString())));
         Assert.Throws<UnauthorizedAccessException>(() => access.Owner(User(owner: Guid.NewGuid().ToString())));
+    }
+
+    [Fact]
+    public async Task StudyAndPositionWritesRejectStaleVersionsAndMovesOnlyChangeAssociation()
+    {
+        var firstStudy = new Study(Guid.NewGuid(), "First");
+        var secondStudy = new Study(Guid.NewGuid(), "Second");
+        await Store.SaveStudyAsync(Owner, firstStudy, true);
+        await Store.SaveStudyAsync(Owner, secondStudy, true);
+        var position = StudyPosition.Create(firstStudy.Id, "One", Initial, "e4", "Original notes");
+        await Store.SavePositionsAsync(Owner, firstStudy.Id, [position], true);
+
+        var firstRename = await client.PutAsJsonAsync($"/api/studies/{firstStudy.Id}",
+            new StudyUpdateRequest(firstStudy.Id, "Renamed", 0));
+        Assert.Equal(HttpStatusCode.OK, firstRename.StatusCode);
+        var staleRename = await client.PutAsJsonAsync($"/api/studies/{firstStudy.Id}",
+            new StudyUpdateRequest(firstStudy.Id, "Lost rename", 0));
+        Assert.Equal(HttpStatusCode.Conflict, staleRename.StatusCode);
+        Assert.Equal("Renamed", (await Store.StudiesAsync(Owner)).Single(s => s.Id == firstStudy.Id).Name);
+
+        await Store.SavePositionAsync(Owner, position with { Notes = "Latest notes" }, 0);
+        await Assert.ThrowsAsync<EditConflictException>(() => Store.MovePositionAsync(Owner, position.Id, secondStudy.Id, 0));
+        var afterConflict = await Store.PositionAsync(Owner, position.Id);
+        Assert.Equal(firstStudy.Id, afterConflict.StudyId);
+        Assert.Equal("Latest notes", afterConflict.Notes);
+
+        await Store.MovePositionAsync(Owner, position.Id, secondStudy.Id, 1);
+        var moved = await Store.PositionAsync(Owner, position.Id);
+        Assert.Equal(secondStudy.Id, moved.StudyId);
+        Assert.Equal("Latest notes", moved.Notes);
+        Assert.Equal("One", moved.Title);
+
+        var stalePosition = await client.PutAsJsonAsync($"/api/positions/{position.Id}",
+            new PositionUpdateRequest(secondStudy.Id, secondStudy.Id, "Stale title", Initial, "e4", "Stale notes", 1));
+        Assert.Equal(HttpStatusCode.Conflict, stalePosition.StatusCode);
+        Assert.Single(await Store.PositionsAsync(Owner, secondStudy.Id));
+        Assert.Empty(await Store.PositionsAsync(Owner, firstStudy.Id));
+    }
+
+    [Fact]
+    public async Task ExistingStudyTablesUpgradeWithZeroVersionsAndKeepRows()
+    {
+        string legacyPath = Path.Combine(directory, "legacy.db");
+        var study = new Study(Guid.NewGuid(), "Legacy");
+        var position = StudyPosition.Create(study.Id, "Preserved", Initial, "e4", "Legacy notes");
+        await using (var connection = new Microsoft.Data.Sqlite.SqliteConnection(
+            new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder { DataSource = legacyPath }.ToString()))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                CREATE TABLE CloudStudies(Id varchar(36) PRIMARY KEY,OwnerId varchar(36) NOT NULL,Name nvarchar(200) NOT NULL);
+                CREATE TABLE CloudPositions(Id varchar(36) PRIMARY KEY,StudyId varchar(36) NOT NULL,OwnerId varchar(36) NOT NULL,
+                    Title nvarchar(200) NOT NULL,Fen TEXT NOT NULL,Solution TEXT NOT NULL,Notes TEXT NOT NULL);
+                INSERT INTO CloudStudies(Id,OwnerId,Name) VALUES($id,$owner,$name);
+                INSERT INTO CloudPositions(Id,StudyId,OwnerId,Title,Fen,Solution,Notes)
+                    VALUES($position,$id,$owner,$title,$fen,$solution,$notes);
+                """;
+            command.Parameters.AddWithValue("$id", study.Id.ToString());
+            command.Parameters.AddWithValue("$owner", Owner);
+            command.Parameters.AddWithValue("$name", study.Name);
+            command.Parameters.AddWithValue("$position", position.Id.ToString());
+            command.Parameters.AddWithValue("$title", position.Title);
+            command.Parameters.AddWithValue("$fen", position.Fen);
+            command.Parameters.AddWithValue("$solution", position.Solution);
+            command.Parameters.AddWithValue("$notes", position.Notes);
+            await command.ExecuteNonQueryAsync();
+        }
+
+        using var legacyFactory = Factory(sqlitePath: legacyPath);
+        var store = legacyFactory.Services.GetRequiredService<CloudStore>();
+        await store.InitializeAsync();
+        var migratedStudy = Assert.Single(await store.StudiesWithVersionsAsync(Owner));
+        var migratedPosition = Assert.Single(await store.PositionsWithVersionsAsync(Owner, study.Id));
+        Assert.Equal(0, migratedStudy.Version);
+        Assert.Equal(0, migratedPosition.Version);
+        Assert.Equal(position, migratedPosition.ToPosition());
     }
 
     [Fact]

@@ -247,10 +247,11 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
     private long puzzleCount;
     private SessionView? current;
     private string notation = "", comment = "", symbol = "";
-    private IReadOnlyList<Study> studies = [];
-    private IReadOnlyList<StudyPosition> positions = [];
+    private IReadOnlyList<VersionedStudy> studies = [];
+    private IReadOnlyList<VersionedStudyPosition> positions = [];
     private IReadOnlyList<HistoryItem> history = [];
     private Guid? selectedStudy, editingPosition, destination;
+    private long studyVersion, positionVersion;
     private long screenshotConsentRevision;
     private string? screenshotGeneration, consentedScreenshotGeneration;
     private string studyName = "", positionTitle = "", positionFen = "", solution = "", positionNotes = "", importSource = "Paste FEN";
@@ -274,7 +275,7 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
             {
                 owner = Access.Owner(user);
                 puzzleCount = await Store.PuzzleCountAsync();
-                studies = await Store.StudiesAsync(owner);
+                studies = await Store.StudiesWithVersionsAsync(owner);
                 theme = await Store.SettingAsync(owner, "theme") == "dark" ? "dark" : "light";
                 string? board = await Store.SettingAsync(owner, "board-set"), set = await Store.SettingAsync(owner, "piece-set");
                 boardId = boards.Any(b => b.Id == board) ? board! : "sage";
@@ -320,7 +321,7 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
         await Run(async () =>
         {
             if (tab == "Results") await ReadHistory();
-            if (tab == "Studies") studies = await Store.StudiesAsync(owner!);
+            if (tab == "Studies") studies = await Store.StudiesWithVersionsAsync(owner!);
             if (tab != "Studies" && page == "Studies") await JS.InvokeVoidAsync("chess.clearScreenshot");
             page = tab;
         });
@@ -405,31 +406,34 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
     private Task CreateStudy() => Run(async () =>
     {
         var study = new Study(Guid.NewGuid(), studyName);
-        await Store.SaveStudyAsync(owner!, study, true); studies = await Store.StudiesAsync(owner!);
+        studyVersion = await Store.SaveStudyAsync(owner!, study, true); studies = await Store.StudiesWithVersionsAsync(owner!);
         selectedStudy = study.Id; studyName = ""; positions = []; NewPosition();
     });
     private Task RenameStudy() => Run(async () =>
     {
-        await Store.SaveStudyAsync(owner!, new(RequireStudy(), studyName), false);
-        studies = await Store.StudiesAsync(owner!); studyName = "";
+        studyVersion = await Store.SaveStudyAsync(owner!, new(RequireStudy(), studyName), false, studyVersion);
+        studies = await Store.StudiesWithVersionsAsync(owner!); studyName = "";
     });
     private Guid RequireStudy() => selectedStudy ?? throw new InvalidOperationException("Create or select a study first.");
     private Task StudyChanged(ChangeEventArgs args) => Run(async () =>
     {
         selectedStudy = Guid.TryParse(args.Value?.ToString(), out var id) ? id : null;
-        positions = selectedStudy is Guid study ? await Store.PositionsAsync(owner!, study) : [];
+        studyVersion = selectedStudy is Guid selected ? studies.First(s => s.Id == selected).Version : 0;
+        positions = selectedStudy is Guid study ? await Store.PositionsWithVersionsAsync(owner!, study) : [];
         NewPosition();
     });
     private void NewPosition()
     {
         editingPosition = null; positionTitle = positionFen = solution = positionNotes = "";
         previewFen = visionNote = null; aiGenerated = fenReviewed = screenshotReady = false; destination = null;
-        screenshotGeneration = consentedScreenshotGeneration = null; screenshotConsentRevision++;
+        positionVersion = 0; screenshotGeneration = consentedScreenshotGeneration = null; screenshotConsentRevision++;
         _ = JS.InvokeVoidAsync("chess.clearScreenshot");
     }
-    private void EditPosition(StudyPosition position)
+    private void EditPosition(VersionedStudyPosition versioned)
     {
-        NewPosition(); editingPosition = position.Id; positionTitle = position.Title; positionFen = position.Fen;
+        NewPosition();
+        var position = versioned.ToPosition();
+        editingPosition = position.Id; positionVersion = versioned.Version; positionTitle = position.Title; positionFen = position.Fen;
         solution = position.Solution; positionNotes = position.Notes;
     }
     private Task SavePosition() => Run(async () =>
@@ -438,9 +442,11 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
         var position = StudyPosition.Create(RequireStudy(), positionTitle, positionFen, solution, positionNotes);
         bool create = editingPosition is null;
         position = position with { Id = editingPosition ?? position.Id };
-        await Store.SavePositionsAsync(owner!, position.StudyId, [position], create);
+        if (create) await Store.SavePositionsAsync(owner!, position.StudyId, [position], true);
+        else await Store.SavePositionAsync(owner!, position, positionVersion);
         editingPosition = position.Id;
-        positions = await Store.PositionsAsync(owner!, position.StudyId); EditPosition(position);
+        positions = await Store.PositionsWithVersionsAsync(owner!, position.StudyId);
+        EditPosition(positions.Single(p => p.Id == position.Id));
         message = "Position saved to your study.";
     });
     private Task PracticePosition() => Run(async () =>
@@ -452,9 +458,8 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
     private Task MovePosition() => Run(async () =>
     {
         if (editingPosition is not Guid id || destination is not Guid target) throw new InvalidOperationException("Select a position and destination.");
-        var position = await Store.PositionAsync(owner!, id);
-        await Store.SavePositionsAsync(owner!, target, [position], false);
-        positions = await Store.PositionsAsync(owner!, RequireStudy()); NewPosition();
+        await Store.MovePositionAsync(owner!, id, target, positionVersion);
+        positions = await Store.PositionsWithVersionsAsync(owner!, RequireStudy()); NewPosition();
     });
     private Task ImportCsv(InputFileChangeEventArgs args) => Run(async () =>
     {
@@ -464,7 +469,7 @@ FORM: Task workspace inherited from the WinUI app; mobile adds bottom navigation
         memory.Position = 0;
         var imported = StudyPosition.ReadCsv(memory, study);
         await Store.SavePositionsAsync(owner!, study, imported, true);
-        positions = await Store.PositionsAsync(owner!, study); message = $"Imported {imported.Count} positions.";
+        positions = await Store.PositionsWithVersionsAsync(owner!, study); message = $"Imported {imported.Count} positions.";
     });
     private Task PreviewPosition() => Run(() => { previewFen = StudyPosition.ValidateFen(positionFen); return Task.CompletedTask; });
     private void SetImportSource(string source)

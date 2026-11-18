@@ -7,6 +7,8 @@ namespace ChessTrainer.Web;
 
 public sealed record VisionRequest(string Png, bool BlackAtBottom);
 public sealed record SettingRequest(string Value);
+public sealed record StudyUpdateRequest(Guid Id, string Name, long? Version);
+public sealed record PositionUpdateRequest(Guid Id, Guid StudyId, string Title, string Fen, string Solution, string Notes, long? Version);
 
 public static class TrainerApi
 {
@@ -20,21 +22,29 @@ public static class TrainerApi
             store.HistoryAsync(access.Owner(user), offset ?? 0, limit ?? 200));
         api.MapGet("/attempts/{id:guid}", (Guid id, ClaimsPrincipal user, CloudTraining training) => training.ReadAsync(user, id));
         api.MapPost("/attempts/{id:guid}/commands", (Guid id, SessionCommand command, ClaimsPrincipal user, CloudTraining training) => training.ApplyAsync(user, id, command));
-        api.MapGet("/studies", (ClaimsPrincipal user, CloudAccess access, CloudStore store) => store.StudiesAsync(access.Owner(user)));
+        api.MapGet("/studies", (ClaimsPrincipal user, CloudAccess access, CloudStore store) => store.StudiesWithVersionsAsync(access.Owner(user)));
         api.MapPost("/studies", async (Study study, ClaimsPrincipal user, CloudAccess access, CloudStore store) =>
         {
             var created = study with { Id = Guid.NewGuid() };
-            await store.SaveStudyAsync(access.Owner(user), created, true);
-            return created;
+            long version = await store.SaveStudyAsync(access.Owner(user), created, true);
+            return new VersionedStudy(created.Id, created.Name.Trim(), version);
         });
-        api.MapPut("/studies/{id:guid}", async (Guid id, Study study, ClaimsPrincipal user, CloudAccess access, CloudStore store) =>
-            await store.SaveStudyAsync(access.Owner(user), study with { Id = id }, false));
+        api.MapPut("/studies/{id:guid}", async (Guid id, StudyUpdateRequest request, ClaimsPrincipal user, CloudAccess access, CloudStore store) =>
+        {
+            long expectedVersion = request.Version ?? throw new ArgumentException("Version is required.");
+            long version = await store.SaveStudyAsync(access.Owner(user), new(id, request.Name), false, expectedVersion);
+            return new VersionedStudy(id, request.Name.Trim(), version);
+        });
         api.MapGet("/studies/{id:guid}/positions", (Guid id, ClaimsPrincipal user, CloudAccess access, CloudStore store) =>
-            store.PositionsAsync(access.Owner(user), id));
+            store.PositionsWithVersionsAsync(access.Owner(user), id));
         api.MapPost("/studies/{id:guid}/positions", async (Guid id, StudyPosition[] positions, ClaimsPrincipal user, CloudAccess access, CloudStore store) =>
             await store.SavePositionsAsync(access.Owner(user), id, positions.Select(p => p with { Id = Guid.NewGuid() }).ToArray(), true));
-        api.MapPut("/positions/{id:guid}", async (Guid id, StudyPosition position, ClaimsPrincipal user, CloudAccess access, CloudStore store) =>
-            await store.SavePositionsAsync(access.Owner(user), position.StudyId, [position with { Id = id }], false));
+        api.MapPut("/positions/{id:guid}", async (Guid id, PositionUpdateRequest request, ClaimsPrincipal user, CloudAccess access, CloudStore store) =>
+        {
+            long expectedVersion = request.Version ?? throw new ArgumentException("Version is required.");
+            await store.SavePositionAsync(access.Owner(user),
+                new StudyPosition(id, request.StudyId, request.Title, request.Fen, request.Solution, request.Notes), expectedVersion);
+        });
         api.MapGet("/settings/{name}", async (string name, ClaimsPrincipal user, CloudAccess access, CloudStore store) =>
         {
             ValidateSetting(name, "");
