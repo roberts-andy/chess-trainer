@@ -28,6 +28,15 @@ function az {
     }
     $global:ChessOperationsTestState.Calls.Add($call)
     $result = switch -Wildcard ($text) {
+        'fixture-stderr *' {
+            Write-Error '/ Running...' -ErrorAction Continue
+            @{ ok = $true }; break
+        }
+        'fixture-failure *' {
+            Write-Error '{"code":"Forbidden","message":"private-upstream-marker"}' -ErrorAction Continue
+            $global:LASTEXITCODE = 1
+            @{}; break
+        }
         '*Microsoft.OperationalInsights/workspaces/*' { @{ properties = @{ retentionInDays = 30 } }; break }
         'containerapp show *' { @{ properties = @{ managedEnvironmentId = "$($global:ChessOperationsTestState.Base)/providers/Microsoft.App/managedEnvironments/chess-trainer-cloud-environment" } }; break }
         'containerapp list *' { @(@{ id = "$($global:ChessOperationsTestState.Base)/providers/Microsoft.App/containerApps/trainer"; environment = "$($global:ChessOperationsTestState.Base)/providers/Microsoft.App/managedEnvironments/chess-trainer-cloud-environment" }); break }
@@ -67,6 +76,13 @@ Assert-That ($retentionPlan.Requires -notcontains 'NotificationEmail' -and
 Assert-That ($global:ChessOperationsTestState.Calls.Count -eq 0) 'Plans must not call Azure.'
 
 $global:ChessOperationsTestState.AllowAz = $true
+. "$root\infra\Operations.Common.ps1"
+$progressResult = Invoke-OperationsAz -Arguments @('fixture-stderr')
+Assert-That $progressResult.ok 'Successful CLI progress on stderr must not corrupt JSON parsing.'
+$failureMessage = ''
+try { Invoke-OperationsAz -Arguments @('fixture-failure') | Out-Null } catch { $failureMessage = $_.Exception.Message }
+Assert-That ($failureMessage -like '*category Forbidden*' -and
+    $failureMessage -notlike '*private-upstream-marker*') 'CLI failures must remain explicit without exposing upstream details.'
 $monitorParameters = @{
     Apply = $true; SubscriptionId = $subscription; AppName = 'trainer'
     SqlServerName = 'sql'; VisionResourceId = $vision; WorkspaceResourceId = $workspace

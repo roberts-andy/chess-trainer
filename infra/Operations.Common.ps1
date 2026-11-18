@@ -14,7 +14,8 @@ function Invoke-OperationsAz {
         }
         throw "Azure CLI operation '$($Arguments[0])' failed (exit $LASTEXITCODE, category $code). Inspect permissions and resource state privately in Azure; upstream responses are not printed."
     }
-    if ($result) { ($result -join "`n") | ConvertFrom-Json -Depth 100 }
+    $stdout = @($result | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
+    if ($stdout.Count) { ($stdout -join "`n") | ConvertFrom-Json -Depth 100 }
 }
 
 function Invoke-OperationsRest {
