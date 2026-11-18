@@ -95,6 +95,11 @@ public sealed class CloudTests : IAsyncLifetime
         view = await Command(view, "notation", "e5 Nf3");
         Assert.Equal(start, view.Fen);
         Assert.Null(view.Results);
+        var endOfLine = view;
+        var frozenNavigation = await Command(view with { Cursor = 0 }, "navigate");
+        Assert.Equal(start, frozenNavigation.Fen);
+        Assert.Null(frozenNavigation.Results);
+        view = await Command(endOfLine, "navigate");
         view = await Command(view, "submit");
         Assert.True(view.Submitted);
         Assert.Equal("e5 Nf3", view.Solution);
@@ -236,6 +241,37 @@ public sealed class CloudTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task NavigationDoesNotPersistOrAdvanceRevision()
+    {
+        var response = await client.PostAsJsonAsync("/api/attempts", new StartRequest(900, 1100));
+        response.EnsureSuccessStatusCode();
+        var started = (await response.Content.ReadFromJsonAsync<SessionView>(JsonOptions))!;
+        var withMove = await Command(started, "notation", "e5");
+        var branched = await Command(withMove, "branch");
+        var before = await Store.AttemptAsync(Owner, branched.Id);
+        string payloadBefore = await AttemptPayloadAsync(branched.Id);
+
+        var navigation = await client.PostAsJsonAsync($"/api/attempts/{branched.Id}/commands",
+            new SessionCommand("navigate", branched.Revision, 1, 1), JsonOptions);
+        navigation.EnsureSuccessStatusCode();
+        var navigated = (await navigation.Content.ReadFromJsonAsync<SessionView>(JsonOptions))!;
+        var after = await Store.AttemptAsync(Owner, started.Id);
+
+        Assert.Equal(1, navigated.LineIndex);
+        Assert.Equal(1, navigated.Cursor);
+        Assert.Equal(branched.Fen, navigated.Fen);
+        Assert.Equal(branched.Revision, navigated.Revision);
+        Assert.Equal(before.Revision, after.Revision);
+        Assert.Equal(JsonSerializer.Serialize(before.Attempt), JsonSerializer.Serialize(after.Attempt));
+        Assert.Equal(payloadBefore, await AttemptPayloadAsync(branched.Id));
+        var mutation = await Command(navigated, "notation", "Nf3");
+        Assert.Equal(branched.Revision + 1, mutation.Revision);
+        var stale = await client.PostAsJsonAsync($"/api/attempts/{started.Id}/commands",
+            new SessionCommand("notation", branched.Revision, 1, 1, "d4"));
+        Assert.Equal(HttpStatusCode.Conflict, stale.StatusCode);
+    }
+
+    [Fact]
     public async Task ApiRejectsMissingAuthenticationForgedHeadersAndCrossSiteWrites()
     {
         using var anonymousFactory = Factory(false);
@@ -323,6 +359,18 @@ public sealed class CloudTests : IAsyncLifetime
         var response = await client.PostAsJsonAsync($"/api/attempts/{view.Id}/commands", new SessionCommand(action, view.Revision, view.LineIndex, view.Cursor, value));
         response.EnsureSuccessStatusCode();
         return (await response.Content.ReadFromJsonAsync<SessionView>(JsonOptions))!;
+    }
+
+    private async Task<string> AttemptPayloadAsync(Guid id)
+    {
+        await using var connection = new Microsoft.Data.Sqlite.SqliteConnection(
+            new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder { DataSource = Path.Combine(directory, "cloud.db") }.ToString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT Payload FROM CloudAttempts WHERE Id=$id AND OwnerId=$owner";
+        command.Parameters.AddWithValue("$id", id.ToString());
+        command.Parameters.AddWithValue("$owner", Owner);
+        return (string)(await command.ExecuteScalarAsync())!;
     }
 
     public async Task DisposeAsync()

@@ -59,6 +59,15 @@ public sealed class CloudTraining(CloudStore store, CloudAccess access)
     {
         string owner = access.Owner(user);
         var saved = await store.AttemptAsync(owner, id);
+        if (command.Action == "navigate")
+        {
+            var projection = new TrainingSession(saved.Attempt);
+            projection.SelectLine(command.LineIndex);
+            if (command.Cursor < 0 || command.Cursor > projection.ActiveLine.Moves.Count)
+                throw new ArgumentException("Select an existing move.");
+            projection.Navigate(command.Cursor);
+            return View(projection, saved.Revision);
+        }
         if (saved.Revision != command.Revision) throw new EditConflictException();
         var session = new TrainingSession(saved.Attempt);
         session.SelectLine(command.LineIndex);
@@ -78,7 +87,6 @@ public sealed class CloudTraining(CloudStore store, CloudAccess access)
                 if (!Enum.TryParse<SolveMode>(command.Value, out var mode) || !Enum.IsDefined(mode)) throw new ArgumentException("Choose a supported mode.");
                 session.Mode = mode;
                 break;
-            case "navigate": break;
             default: throw new ArgumentException("Unknown analysis action.");
         }
         await store.SaveAttemptAsync(owner, session.Snapshot(), saved.Revision);
