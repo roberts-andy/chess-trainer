@@ -198,4 +198,8 @@ Refresh the bundled CC0 sample from the first 2,000 records of the current archi
 dotnet run --project tools\RefreshStarter -- data\starter-puzzles.csv
 ```
 
+## License
+
+Original project code is licensed under the [MIT License](LICENSE). Third-party dependencies, artwork and data retain their respective licenses.
+
 Dependency and artwork notices are in `THIRD-PARTY-NOTICES.txt` and are copied into application output. `tools\Download-Pieces.ps1` reproducibly downloads the five SVG sets from a pinned Lichess source revision; their license files are in `src\ChessTrainer.App\Assets\Pieces`.
